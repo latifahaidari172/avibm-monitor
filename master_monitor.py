@@ -32,8 +32,9 @@ SA_HOME_URL      = "https://www.ecom.transport.sa.gov.au/et/welcome.jsp"
 QLD_LOCATIONS    = ["Brisbane", "Burleigh Heads", "Narangba", "Yatala"]
 QLD_CAPTCHA_KEY  = "6LfAG_0pAAAAAFQzCmk7OQ4roYKXfgYFAPwsVo-5"
 
-# Supabase new-format keys (sb_secret_...) use Authorization header only
+# Supabase requires both apikey and Authorization headers
 HEADERS          = {
+    "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=representation",
