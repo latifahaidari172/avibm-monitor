@@ -531,7 +531,7 @@ def run():
                 if not cutoff: continue
 
                 label = f"{customer['first_name']} {customer['last_name']}"
-                log(f"Checking SA / {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
+                log(f"Checking [🥇 PRIORITY] SA / {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
 
                 slots = sa_check(customer, vehicle, cutoff)
                 log_result(customer["id"], vehicle["id"], "SA", "Regency Park", "Checked", f"{len(slots)} slots found")
