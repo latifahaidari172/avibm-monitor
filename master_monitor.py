@@ -512,6 +512,28 @@ def run():
 
     log("All done.")
 
+    # Update monitor status in Supabase
+    try:
+        now_str = datetime.now(TZ).strftime("%d/%m/%Y %I:%M:%S %p")
+        status_data = {
+            "id": "main",
+            "last_run": now_str,
+            "active_customers": len(active_customers),
+            "qld_count": len(qld_customers),
+            "sa_count": len(sa_customers),
+            "status": "running",
+        }
+        # Try upsert
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/monitor_status",
+            json=status_data,
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        if r.status_code not in (200, 201, 204):
+            log(f"Status update response: {r.status_code}", "WARN")
+    except Exception as e:
+        log(f"Could not update monitor status: {e}", "WARN")
+
 
 if __name__ == "__main__":
     run()
