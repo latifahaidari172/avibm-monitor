@@ -473,7 +473,8 @@ def run():
             log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
             confirmed = qld_book_slot(loc, ds, customer, vehicle)
             if confirmed:
-                db_patch("vehicles", "id", vehicle["id"], {"booked_date": ds})
+                old_cutoff = vehicle.get("cutoff_date", "")
+                db_patch("vehicles", "id", vehicle["id"], {"booked_date": ds, "previous_cutoff": old_cutoff, "cutoff_date": ds})
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
                 booking_html = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/></head>
