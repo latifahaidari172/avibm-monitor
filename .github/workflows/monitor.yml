@@ -1,0 +1,40 @@
+name: AVIBM Master Monitor
+
+on:
+  schedule:
+    - cron: '*/1 20,21,22,23 * * *'   # every 1 min 6:30-10am Brisbane
+    - cron: '*/1 0 * * *'
+    - cron: '*/5 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 * * *'  # every 5 min otherwise
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+
+      - run: pip install selenium requests python-dateutil
+
+      - name: Run master monitor
+        env:
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TWOCAPTCHA_API_KEY:  ${{ secrets.TWOCAPTCHA_API_KEY }}
+          GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python master_monitor.py
