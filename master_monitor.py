@@ -442,6 +442,13 @@ def run():
                         log(f"  Skipping {customer['first_name']} — invalid cutoff: {raw_cutoff}", "WARN")
                         continue
 
+                    # Auto-deactivate vehicle if cutoff date was more than 24 hours ago
+                    now_naive = datetime.now()
+                    if (now_naive - cutoff).total_seconds() > 86400:
+                        log(f"  Auto-deactivating vehicle — cutoff {cutoff.strftime('%d/%m/%Y')} has passed by more than 24 hours")
+                        db_patch("vehicles", "id", vehicle["id"], {"active": False})
+                        continue
+
                     label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
                     log(f"Checking [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
 
