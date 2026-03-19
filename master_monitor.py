@@ -59,11 +59,20 @@ def parse_date(s):
             except: pass
     return None
 
-def send_email(subject, body, to):
-    msg = MIMEText(body, "plain")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_ADDR
-    msg["To"]      = to
+def send_email(subject, body, to, html=None):
+    from email.mime.multipart import MIMEMultipart
+    if html:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = GMAIL_ADDR
+        msg["To"]      = to
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html, "html"))
+    else:
+        msg = MIMEText(body, "plain")
+        msg["Subject"] = subject
+        msg["From"]    = GMAIL_ADDR
+        msg["To"]      = to
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(GMAIL_ADDR, GMAIL_PASS)
@@ -466,14 +475,47 @@ def run():
             if confirmed:
                 db_patch("vehicles", "id", vehicle["id"], {"booked_date": ds})
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
+                booking_html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:40px 20px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#111;border:1px solid #2a2a2a;border-radius:12px 12px 0 0;padding:32px 40px;text-align:center;">
+  <div style="font-size:32px;font-weight:900;letter-spacing:0.2em;color:#C9A84C;font-family:Arial Black,Arial,sans-serif;">AVIBM</div>
+  <div style="font-size:11px;letter-spacing:0.25em;color:#666;margin-top:4px;text-transform:uppercase;">Australian Vehicle Inspection Booking Monitor</div>
+  <div style="width:60px;height:2px;background:#C9A84C;margin:16px auto 0;"></div>
+</td></tr>
+<tr><td style="background:#141414;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;padding:40px;">
+  <div style="text-align:center;margin-bottom:28px;">
+    <h1 style="margin:0 0 8px;font-size:28px;font-weight:900;color:#ffffff;">BOOKING CONFIRMED</h1>
+    <p style="margin:0;font-size:15px;color:#C9A84C;">We found you an earlier slot!</p>
+  </div>
+  <p style="margin:0 0 24px;font-size:15px;color:#aaa;line-height:1.7;">Great news! We found an earlier inspection slot and have automatically rebooked your vehicle. Here are your new booking details:</p>
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:24px;">
+  <tr><td style="padding:24px;">
+    <div style="font-size:11px;letter-spacing:0.15em;color:#5adb5a;text-transform:uppercase;margin-bottom:16px;">New Booking Details</div>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr><td style="padding:6px 0;font-size:13px;color:#4a7a4a;width:120px;">Location</td><td style="padding:6px 0;font-size:15px;color:#fff;font-weight:700;">{loc}</td></tr>
+      <tr><td style="padding:6px 0;font-size:13px;color:#4a7a4a;">Date</td><td style="padding:6px 0;font-size:15px;color:#5adb5a;font-weight:700;">{ds}</td></tr>
+    </table>
+  </td></tr></table>
+  <div style="padding:16px 20px;background:#1a1a0a;border:1px solid #3a3a00;border-radius:8px;margin-bottom:24px;">
+    <p style="margin:0;font-size:13px;color:#C9A84C;line-height:1.6;">Please verify your booking at <a href="https://wovi.com.au" style="color:#C9A84C;">wovi.com.au</a> and contact Queensland Inspection Services on 1300 722 411 if you have any questions.</p>
+  </div>
+  <p style="margin:0;font-size:13px;color:#555;line-height:1.7;">Thank you for using AVIBM. Our system will continue monitoring in case an even earlier slot becomes available.</p>
+</td></tr>
+<tr><td style="background:#0f0f0f;border:1px solid #2a2a2a;border-top:1px solid #1e1e1e;border-radius:0 0 12px 12px;padding:24px 40px;text-align:center;">
+  <div style="font-size:12px;color:#444;line-height:1.8;">AVIBM — Australian Vehicle Inspection Booking Monitor<br/>
+  <a href="https://avibm.vercel.app" style="color:#C9A84C;text-decoration:none;">avibm.vercel.app</a></div>
+</td></tr>
+</table></td></tr></table>
+</body></html>"""
                 send_email(
-                    f"WOVI Booking Confirmed — {loc} on {ds}",
-                    f"Great news! Your WOVI inspection has been rescheduled.\n\n"
-                    f"Location: {loc}\nDate: {ds}\n\n"
-                    f"Please verify at wovi.com.au\n"
-                    f"Questions: 1300 722 411 / adminqis@wovi.com.au\n\n"
-                    f"— AVIBM Automated Booking Monitor",
-                    customer["email"]
+                    f"AVIBM — Booking Confirmed: {loc} on {ds}",
+                    f"Great news! We found an earlier slot and rebooked your vehicle.\n\nLocation: {loc}\nDate: {ds}\n\nPlease verify at wovi.com.au\n— AVIBM",
+                    customer["email"],
+                    html=booking_html,
                 )
             else:
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKING FAILED", ds)
