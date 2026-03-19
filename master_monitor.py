@@ -29,7 +29,7 @@ QLD_BOOKING_URL  = "https://wovi.com.au/bookings/"
 SA_BOOKING_URL   = "https://www.ecom.transport.sa.gov.au/et/rescheduleAVehicleInspectionBooking.do"
 SA_HOME_URL      = "https://www.ecom.transport.sa.gov.au/et/welcome.jsp"
 
-QLD_LOCATIONS    = ["Brisbane", "Burleigh Heads", "Narangba", "Yatala"]
+QLD_LOCATIONS    = ["Brisbane", "Bundaberg", "Burleigh Heads", "Cairns", "Mackay", "Narangba", "Rockhampton City", "Toowoomba", "Townsville", "Yatala"]
 QLD_CAPTCHA_KEY  = "6LfAG_0pAAAAAFQzCmk7OQ4roYKXfgYFAPwsVo-5"
 
 # Supabase requires both apikey and Authorization headers
@@ -188,10 +188,11 @@ def click_next(driver, wait):
 
 # ── QLD Monitor ───────────────────────────────────────────────────────────────
 
-def qld_find_slots(driver, cutoff, label):
+def qld_find_slots(driver, cutoff, label, locations=None):
     wait = WebDriverWait(driver, 20)
     slots = []
-    for location in QLD_LOCATIONS:
+    check_locations = locations if locations else QLD_LOCATIONS
+    for location in check_locations:
         try:
             sel = wait.until(EC.presence_of_element_located((By.XPATH,
                 "//select[.//option[contains(text(),'Brisbane')]]"
@@ -435,7 +436,8 @@ def run():
                     label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
                     log(f"Checking [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
 
-                    slots = qld_find_slots(driver, cutoff, label)
+                    vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
+                    slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
                     log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
 
                     if slots:
