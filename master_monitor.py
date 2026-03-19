@@ -73,8 +73,15 @@ def send_email(subject, body, to):
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
 def db_get(table, params=""):
-    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=HEADERS)
-    return r.json()
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers={
+        **HEADERS,
+        "Prefer": "return=representation",
+    })
+    try:
+        return r.json()
+    except Exception:
+        log(f"Supabase response error: {r.status_code} {r.text}", "ERROR")
+        return []
 
 def db_patch(table, match_key, match_val, data):
     requests.patch(
@@ -378,8 +385,11 @@ def run():
     if isinstance(customers, dict) and customers.get("error"):
         log(f"Failed to fetch customers: {customers}", "ERROR")
         sys.exit(1)
+    if not isinstance(customers, list):
+        log(f"Unexpected response from Supabase: {customers}", "ERROR")
+        sys.exit(1)
 
-    active_customers = [c for c in customers if c.get("active")]
+    active_customers = [c for c in customers if isinstance(c, dict) and c.get("active")]
     log(f"Found {len(active_customers)} active customer(s)")
 
     if not active_customers:
