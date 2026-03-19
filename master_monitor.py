@@ -523,14 +523,17 @@ def run():
             "sa_count": len(sa_customers),
             "status": "running",
         }
-        # Try upsert
+        # Delete existing row first then insert fresh
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/monitor_status?id=eq.main",
+            headers=HEADERS,
+        )
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/monitor_status",
             json=status_data,
-            headers={**HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers=HEADERS,
         )
-        if r.status_code not in (200, 201, 204):
-            log(f"Status update response: {r.status_code}", "WARN")
+        log(f"Monitor status update: {r.status_code} {r.text[:100]}")
     except Exception as e:
         log(f"Could not update monitor status: {e}", "WARN")
 
