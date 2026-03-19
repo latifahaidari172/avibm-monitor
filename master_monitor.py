@@ -36,6 +36,7 @@ HEADERS          = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
+    "Prefer": "return=representation",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -73,12 +74,13 @@ def send_email(subject, body, to):
 # ── Supabase ──────────────────────────────────────────────────────────────────
 
 def db_get(table, params=""):
-    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers={
-        **HEADERS,
-        "Prefer": "return=representation",
-    })
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=HEADERS)
     try:
-        return r.json()
+        data = r.json()
+        if r.status_code not in (200, 201):
+            log(f"Supabase error {r.status_code}: {data}", "ERROR")
+            return []
+        return data
     except Exception:
         log(f"Supabase response error: {r.status_code} {r.text}", "ERROR")
         return []
@@ -381,6 +383,8 @@ def run():
     log("=" * 60)
 
     # Fetch all active customers with their vehicles
+    log(f"Connecting to Supabase: {SUPABASE_URL}")
+    log(f"Key prefix: {SUPABASE_KEY[:20]}...")
     customers = db_get("customers", "active=eq.true&select=*,vehicles(*)")
     if isinstance(customers, dict) and customers.get("error"):
         log(f"Failed to fetch customers: {customers}", "ERROR")
