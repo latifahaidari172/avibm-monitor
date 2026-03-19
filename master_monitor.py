@@ -514,7 +514,7 @@ def run():
 
     # Update monitor status in Supabase
     try:
-        now_str = datetime.now(TZ).strftime("%d/%m/%Y %I:%M:%S %p")
+        now_str = datetime.now(timezone.utc).strftime("%d/%m/%Y %I:%M:%S %p UTC")
         status_data = {
             "id": "main",
             "last_run": now_str,
