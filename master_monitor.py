@@ -529,8 +529,30 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 angular.element(document.body).scope().$apply();
             } catch(e) {}
         """, token)
-        # Submit immediately — no delay, token expires in ~2 mins
-        log(f"  [BOOK] CAPTCHA token injected — submitting immediately...")
+        # Re-inject token right before clicking submit (in case it expired during long solve)
+        driver.execute_script("""
+            var token=arguments[0];
+            var el1=document.getElementById('g-recaptcha-response');
+            if(el1){el1.innerHTML=token;el1.value=token;}
+            var els=document.querySelectorAll('[name="g-recaptcha-response"]');
+            els.forEach(function(el){el.innerHTML=token;el.value=token;});
+            try {
+                var cfg=window.___grecaptcha_cfg;
+                if(cfg&&cfg.clients){
+                    Object.keys(cfg.clients).forEach(function(key){
+                        var client=cfg.clients[key];
+                        Object.keys(client).forEach(function(k){
+                            var obj=client[k];
+                            if(obj&&typeof obj.callback==='function'){try{obj.callback(token);}catch(e){}}
+                            if(obj&&obj.l&&typeof obj.l==='function'){try{obj.l(token);}catch(e){}}
+                        });
+                    });
+                }
+            } catch(e){}
+            try{angular.element(document.body).scope().$apply();}catch(e){}
+        """, token)
+        time.sleep(1)
+        log(f"  [BOOK] CAPTCHA token re-injected — submitting...")
         log(f"  [BOOK] Clicking Submit My Booking Request...")
         click_next(driver, wait)
         time.sleep(4)
