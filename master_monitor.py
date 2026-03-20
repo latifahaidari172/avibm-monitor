@@ -269,14 +269,17 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 clicked = True; time.sleep(2); break
         if not clicked: return False
 
-        # Select earliest time
+        # Select earliest time and capture it
+        selected_time = ""
         try:
             ts = driver.find_element(By.XPATH,
                 "//select[contains(@ng-model,'time') or contains(@ng-change,'time')]")
             opts = sorted([o for o in Select(ts).options
                            if o.get_attribute("value") not in ("","null","undefined","0")],
                           key=lambda o: o.text)
-            if opts: Select(ts).select_by_visible_text(opts[0].text)
+            if opts:
+                Select(ts).select_by_visible_text(opts[0].text)
+                selected_time = opts[0].text
         except NoSuchElementException: pass
 
         time.sleep(1)
@@ -339,10 +342,10 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         confirmed = any(w in driver.page_source.lower() for w in
                         ["booking has been secured","booking number","confirmed","success","thank you","submitted"])
-        return confirmed
+        return (confirmed, selected_time)
 
     except Exception as e:
-        log(f"QLD booking error: {e}", "ERROR"); return False
+        log(f"QLD booking error: {e}", "ERROR"); return (False, "")
     finally:
         driver.quit()
 
@@ -478,10 +481,18 @@ def run():
             current_tier = tier
 
             log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
-            confirmed = qld_book_slot(loc, ds, customer, vehicle)
+            result = qld_book_slot(loc, ds, customer, vehicle)
+            confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
             if confirmed:
                 old_cutoff = vehicle.get("cutoff_date", "")
-                db_patch("vehicles", "id", vehicle["id"], {"booked_date": ds, "previous_cutoff": old_cutoff, "cutoff_date": ds})
+                booking_slot = f"{ds} at {booked_time}" if booked_time else ds
+                db_patch("vehicles", "id", vehicle["id"], {
+                    "booked_date": ds,
+                    "booked_time": booked_time,
+                    "booked_location": loc,
+                    "previous_cutoff": old_cutoff,
+                    "cutoff_date": ds,
+                })
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
                 booking_html = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/></head>
@@ -520,8 +531,8 @@ def run():
 </table></td></tr></table>
 </body></html>"""
                 send_email(
-                    f"AVIBM — Booking Confirmed: {loc} on {ds}",
-                    f"Great news! We found an earlier slot and rebooked your vehicle.\n\nLocation: {loc}\nDate: {ds}\n\nPlease verify at wovi.com.au\n— AVIBM",
+                    f"AVIBM — Booking Confirmed: {loc} on {ds}" + (f" at {booked_time}" if booked_time else ""),
+                    f"Great news! We found an earlier slot and rebooked your vehicle.\n\nLocation: {loc}\nDate: {ds}" + (f"\nTime: {booked_time}" if booked_time else "") + f"\n\nPlease verify at wovi.com.au\n— AVIBM",
                     customer["email"],
                     html=booking_html,
                 )
