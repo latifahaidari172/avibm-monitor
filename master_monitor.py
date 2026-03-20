@@ -605,6 +605,11 @@ def run():
                     slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
                     log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
 
+                    # Skip if booking already in progress from a previous run
+                    if vehicle.get("booking_in_progress"):
+                        log(f"  Skipping {label} — booking already in progress")
+                        continue
+
                     if slots:
                         priority_locs = vehicle.get("priority_locations") or []
 
@@ -645,6 +650,8 @@ def run():
             current_tier = tier
 
             log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
+            # Mark as in progress so concurrent runs don't try the same booking
+            db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": True})
             result = qld_book_slot(loc, ds, customer, vehicle)
             confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
             if confirmed:
@@ -656,6 +663,7 @@ def run():
                     "booked_location": loc,
                     "previous_cutoff": old_cutoff,
                     "cutoff_date": ds,
+                    "booking_in_progress": False,
                 })
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
                 booking_html = f"""<!DOCTYPE html>
@@ -703,6 +711,7 @@ def run():
             else:
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKING FAILED", ds)
                 log(f"  Booking failed for {customer['first_name']} {customer['last_name']}", "WARN")
+                db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False})
 
     # ── SA: requests-based, no browser needed ────────────────────────────────
     if sa_customers:
