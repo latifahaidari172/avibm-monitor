@@ -326,7 +326,12 @@ def qld_book_slot(location, date_str, customer, vehicle):
         fill(driver, vehicle["vin"],            "vin","chassis","VIN","vinChassis")
         fill(driver, vehicle["make"],           "make","vehicleMake")
         fill(driver, vehicle["model"],          "model","vehicleModel")
-        fill(driver, vehicle["year"],           "year","buildYear","buildDateYear")
+        # Year is a dropdown
+        if not sel_by(driver, vehicle["year"],
+            "//select[contains(@name,'year') or contains(@ng-model,'year') or "
+            "contains(@name,'buildYear') or contains(@ng-model,'buildYear') or "
+            "contains(@name,'buildDateYear') or contains(@ng-model,'buildDateYear')]"):
+            fill(driver, vehicle["year"], "year","buildYear","buildDateYear")
         fill(driver, vehicle["colour"],         "colour","color","vehicleColour")
         fill(driver, vehicle["purchased_from"], "purchasedFrom","sellerName")
         sel_by(driver, vehicle.get("build_month",""),
