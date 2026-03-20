@@ -465,75 +465,52 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         log(f"  [BOOK] Page after submit: {driver.title}")
 
-        # Handle "Would you like to update your booking?" popup — click "Update Booking"
+        # Handle "Would you like to update your booking?" popup
+        clicked_popup = False
         try:
             WebDriverWait(driver, 12).until(
                 EC.presence_of_element_located((By.XPATH,
                     "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
                 ))
             )
+            log("  Popup detected — triggering Update Booking via Angular")
             time.sleep(1)
-            log("  Popup detected — looking for 'Update Booking' button")
 
-            clicked_popup = False
-            # Try every possible element containing "update booking"
-            candidates = driver.find_elements(By.XPATH,
-                "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
-            )
-            for el in candidates:
-                try:
-                    if el.is_displayed():
-                        driver.execute_script("arguments[0].click();", el)
-                        log("  Clicked 'Update Booking' on popup")
-                        clicked_popup = True
-                        time.sleep(4)
-                        break
-                except Exception:
-                    continue
-
-            if not clicked_popup:
-                log("  Could not click 'Update Booking' — trying JS modal dismiss", "WARN")
-                # Try clicking any visible modal button as fallback
-                try:
-                    modal_btns = driver.find_elements(By.XPATH,
-                        "//div[contains(@class,'modal') or contains(@class,'dialog') or contains(@class,'popup')]//button"
-                    )
-                    for btn in modal_btns:
-                        if btn.is_displayed() and 'update' in btn.text.lower():
-                            driver.execute_script("arguments[0].click();", btn)
-                            log("  Clicked modal button via fallback")
-                            time.sleep(4)
-                            break
-                except Exception:
-                    pass
+            result = driver.execute_script("""
+                try {
+                    var btn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
+                    if (btn) { angular.element(btn).triggerHandler('click'); return 'triggered'; }
+                    return 'not found';
+                } catch(e) { return 'error: ' + e.toString(); }
+            """)
+            log(f"  triggerHandler result: {result}")
+            if result == 'triggered':
+                log("  ✓ Update Booking triggered via Angular")
+                clicked_popup = True
+                time.sleep(4)
+            else:
+                log(f"  triggerHandler failed: {result}", "WARN")
 
         except TimeoutException:
-            log("  No 'Update Booking' popup appeared — continuing")
+            log("  No 'Update Booking' popup appeared — booking failed", "WARN")
 
-        # After clicking Update Booking, wait for confirmation page
-        time.sleep(4)
-
-        time.sleep(2)
+        # Wait for confirmation page
+        time.sleep(3)
         page_source = driver.page_source
         page_lower  = page_source.lower()
         log(f"  Page after final step: {driver.title}")
         log(f"  URL: {driver.current_url}")
 
-        # Only confirm if popup was actually clicked AND page shows booking details
-        confirmed = clicked_popup and (
-            "booking has been secured" in page_lower
-            or "your booking reference" in page_lower
-            or "inspection has been booked" in page_lower
-            or "confirmed" in page_lower
-        )
+        # Only confirm if Update Booking was actually clicked
+        confirmed = clicked_popup and any(w in page_lower for w in [
+            "booking has been secured", "your booking reference",
+            "inspection has been booked", "confirmed", "success", "thank you"
+        ])
 
         if confirmed:
             log(f"  ✅ Booking confirmed!")
         else:
-            if not clicked_popup:
-                log(f"  ❌ Booking NOT confirmed — Update Booking popup was not clicked", "WARN")
-            else:
-                log(f"  ❌ Booking NOT confirmed — confirmation phrase not found", "WARN")
+            log(f"  ❌ Booking NOT confirmed — Update Booking popup not clicked or confirmation not found", "WARN")
 
         return (confirmed, selected_time)
 
