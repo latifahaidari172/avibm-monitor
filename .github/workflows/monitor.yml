@@ -30,6 +30,12 @@ jobs:
 
       - run: pip install selenium requests python-dateutil
 
+      - name: Start virtual display (Xvfb)
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1280x900x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+
       - name: Run master monitor
         env:
           SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
