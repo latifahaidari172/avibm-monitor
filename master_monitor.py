@@ -130,31 +130,44 @@ def make_driver():
 
 # ── 2captcha ──────────────────────────────────────────────────────────────────
 
-def solve_captcha(site_key, page_url):
-    try:
-        r = requests.post("http://2captcha.com/in.php", data={
-            "key": TWOCAPTCHA_KEY, "method": "userrecaptcha",
-            "googlekey": site_key, "pageurl": page_url, "json": 1,
-        }, timeout=30).json()
-        if r.get("status") != 1: return None
-        cid = r["request"]
-        for _ in range(24):
-            time.sleep(5)
-            try:
-                resp = requests.get("http://2captcha.com/res.php", params={
-                    "key": TWOCAPTCHA_KEY, "action": "get", "id": cid, "json": 1
-                }, timeout=10)
+def solve_captcha(site_key, page_url, retries=2):
+    """Solve reCAPTCHA via 2captcha with retries on failure."""
+    for attempt in range(retries):
+        try:
+            if attempt > 0:
+                log(f"  CAPTCHA retry {attempt}/{retries-1}...")
+            r = requests.post("http://2captcha.com/in.php", data={
+                "key": TWOCAPTCHA_KEY, "method": "userrecaptcha",
+                "googlekey": site_key, "pageurl": page_url, "json": 1,
+            }, timeout=30).json()
+            if r.get("status") != 1:
+                log(f"  CAPTCHA submit failed: {r.get('request')}", "WARN")
+                continue
+            cid = r["request"]
+            log(f"  CAPTCHA submitted (ID: {cid})")
+            for _ in range(30):  # up to 150 seconds
+                time.sleep(5)
                 try:
-                    p = resp.json()
-                    if p.get("status") == 1: return p["request"]
-                    if p.get("request") != "CAPCHA_NOT_READY": return None
-                except:
-                    t = resp.text.strip()
-                    if t.startswith("OK|"): return t[3:]
-                    if t != "CAPCHA_NOT_READY": return None
-            except: continue
-        return None
-    except: return None
+                    resp = requests.get("http://2captcha.com/res.php", params={
+                        "key": TWOCAPTCHA_KEY, "action": "get", "id": cid, "json": 1
+                    }, timeout=10)
+                    try:
+                        p = resp.json()
+                        if p.get("status") == 1:
+                            log("  CAPTCHA solved!")
+                            return p["request"]
+                        if p.get("request") != "CAPCHA_NOT_READY":
+                            log(f"  CAPTCHA error: {p.get('request')}", "WARN")
+                            break  # try again
+                    except:
+                        t = resp.text.strip()
+                        if t.startswith("OK|"): return t[3:]
+                        if t != "CAPCHA_NOT_READY": break
+                except: continue
+        except Exception as e:
+            log(f"  CAPTCHA exception: {e}", "WARN")
+    log("  CAPTCHA failed after all retries", "WARN")
+    return None
 
 # ── Form helpers ──────────────────────────────────────────────────────────────
 
@@ -297,18 +310,34 @@ def qld_book_slot(location, date_str, customer, vehicle):
             return (False, "")
 
         log(f"  [BOOK] Selecting time slot...")
-        # Select earliest time and capture it
         selected_time = ""
+        time.sleep(2)
         try:
-            ts = driver.find_element(By.XPATH,
-                "//select[contains(@ng-model,'time') or contains(@ng-change,'time')]")
-            opts = sorted([o for o in Select(ts).options
-                           if o.get_attribute("value") not in ("","null","undefined","0")],
-                          key=lambda o: o.text)
-            if opts:
-                Select(ts).select_by_visible_text(opts[0].text)
-                selected_time = opts[0].text
-        except NoSuchElementException: pass
+            time_btns = driver.find_elements(By.XPATH,
+                "//button[contains(@data-ng-repeat,'Slot in bookingSlots') or "
+                "contains(@data-ng-click,'selectedBookingSlotId')]")
+            if time_btns:
+                def parse_12hr(btn):
+                    try: return datetime.strptime(btn.text.strip().upper().replace(" ",""), "%I:%M%p")
+                    except:
+                        try: return datetime.strptime(btn.text.strip().upper().replace(" ",""), "%I%p")
+                        except: return datetime.max
+                earliest_btn = min(time_btns, key=parse_12hr)
+                driver.execute_script("arguments[0].click();", earliest_btn)
+                selected_time = earliest_btn.text.strip()
+                log(f"  [BOOK] Selected time: {selected_time}")
+            else:
+                # Fallback to select dropdown
+                ts = driver.find_element(By.XPATH,
+                    "//select[contains(@ng-model,'time') or contains(@ng-change,'time')]")
+                opts = sorted([o for o in Select(ts).options
+                               if o.get_attribute("value") not in ("","null","undefined","0")],
+                              key=lambda o: o.text)
+                if opts:
+                    Select(ts).select_by_visible_text(opts[0].text)
+                    selected_time = opts[0].text
+        except Exception as e:
+            log(f"  [BOOK] Time slot error: {e}", "WARN")
 
         time.sleep(1)
         log(f"  [BOOK] Clicking Next (after time)...")
@@ -612,21 +641,22 @@ def run():
 
                     if slots:
                         priority_locs = vehicle.get("priority_locations") or []
-
-                        # Try priority locations first (if they have the same earliest date)
                         chosen = None
+
                         if priority_locs:
+                            # Find earliest date across ALL locations
                             earliest_dt = slots[0][0]
-                            # Find slots on the earliest date at a priority location
+                            # Check if any priority location has a slot on that earliest date
                             priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
                             if priority_slots:
                                 chosen = priority_slots[0]
                                 log(f"  → Priority slot: {chosen[1]} at {chosen[2]}")
                             else:
-                                # No priority location has the earliest date — use any earliest
+                                # Priority locations don't have earliest date — book earliest anywhere
                                 chosen = slots[0]
-                                log(f"  → No priority slot on {slots[0][1]} — using {chosen[2]}")
+                                log(f"  → No priority slot available — using earliest: {chosen[1]} at {chosen[2]}")
                         else:
+                            # No priority set — just book earliest slot
                             chosen = slots[0]
 
                         dt, ds, loc = chosen
