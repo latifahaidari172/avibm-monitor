@@ -347,7 +347,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         # Customer details
         log(f"  [BOOK] Filling customer details...")
-        fill(driver, customer["crn"],        "crn","CRN","licenceNumber","crnLicence")
+        fill(driver, customer["crn"],        "qldCRN","crn","CRN","licenceNumber","crnLicence")
         fill(driver, customer["first_name"], "firstName","first_name","fname")
         fill(driver, customer["last_name"],  "lastName","last_name","surname")
         fill(driver, customer["address"],    "address","streetAddress","street")
