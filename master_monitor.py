@@ -311,11 +311,18 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         log(f"  [BOOK] Selecting time slot...")
         selected_time = ""
-        time.sleep(2)
+        time.sleep(3)
         try:
+            # Try button-based time slots first (data-ng-repeat)
             time_btns = driver.find_elements(By.XPATH,
                 "//button[contains(@data-ng-repeat,'Slot in bookingSlots') or "
                 "contains(@data-ng-click,'selectedBookingSlotId')]")
+            if not time_btns:
+                # Wait a bit more and retry
+                time.sleep(3)
+                time_btns = driver.find_elements(By.XPATH,
+                    "//button[contains(@data-ng-repeat,'Slot in bookingSlots') or "
+                    "contains(@data-ng-click,'selectedBookingSlotId')]")
             if time_btns:
                 def parse_12hr(btn):
                     try: return datetime.strptime(btn.text.strip().upper().replace(" ",""), "%I:%M%p")
@@ -327,15 +334,29 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 selected_time = earliest_btn.text.strip()
                 log(f"  [BOOK] Selected time: {selected_time}")
             else:
-                # Fallback to select dropdown
-                ts = driver.find_element(By.XPATH,
-                    "//select[contains(@ng-model,'time') or contains(@ng-change,'time')]")
-                opts = sorted([o for o in Select(ts).options
-                               if o.get_attribute("value") not in ("","null","undefined","0")],
-                              key=lambda o: o.text)
-                if opts:
-                    Select(ts).select_by_visible_text(opts[0].text)
-                    selected_time = opts[0].text
+                # Fallback: try via Angular scope
+                result = driver.execute_script("""
+                    try {
+                        var btns = document.querySelectorAll('button');
+                        var timeSlots = [];
+                        for (var i=0; i<btns.length; i++) {
+                            var ngr = btns[i].getAttribute('data-ng-repeat') || btns[i].getAttribute('ng-repeat') || '';
+                            if (ngr.indexOf('Slot') !== -1 || ngr.indexOf('bookingSlot') !== -1) {
+                                timeSlots.push(btns[i]);
+                            }
+                        }
+                        if (timeSlots.length > 0) {
+                            timeSlots[0].click();
+                            return timeSlots[0].textContent.trim();
+                        }
+                        return null;
+                    } catch(e) { return null; }
+                """)
+                if result:
+                    selected_time = result
+                    log(f"  [BOOK] Selected time via JS: {selected_time}")
+                else:
+                    log(f"  [BOOK] No time slots found — proceeding without time selection", "WARN")
         except Exception as e:
             log(f"  [BOOK] Time slot error: {e}", "WARN")
 
@@ -492,30 +513,27 @@ def qld_book_slot(location, date_str, customer, vehicle):
         # After clicking Update Booking, wait for confirmation page
         time.sleep(4)
 
+        time.sleep(2)
         page_source = driver.page_source
         page_lower  = page_source.lower()
-        page_title  = driver.title
-        page_url    = driver.current_url
-        log(f"  Page after final step: {page_title}")
-        log(f"  URL: {page_url}")
+        log(f"  Page after final step: {driver.title}")
+        log(f"  URL: {driver.current_url}")
 
-        # Only confirm if WOVI shows a REAL booking confirmation
-        # Must contain "booking has been secured" OR a booking reference number
-        confirmed = (
+        # Only confirm if popup was actually clicked AND page shows booking details
+        confirmed = clicked_popup and (
             "booking has been secured" in page_lower
             or "your booking reference" in page_lower
             or "inspection has been booked" in page_lower
+            or "confirmed" in page_lower
         )
 
-        # Log a snippet of the page to help debug
-        snippet = page_source[:500].replace("\n", " ").replace("\r", "")
-        log(f"  Page snippet: {snippet[:200]}")
-
         if confirmed:
-            log(f"  ✅ Booking confirmed — WOVI confirmation phrase detected!")
+            log(f"  ✅ Booking confirmed!")
         else:
-            log(f"  ❌ Booking NOT confirmed — WOVI confirmation phrase NOT found", "WARN")
-            log(f"  This may be a false positive — NOT marking as booked", "WARN")
+            if not clicked_popup:
+                log(f"  ❌ Booking NOT confirmed — Update Booking popup was not clicked", "WARN")
+            else:
+                log(f"  ❌ Booking NOT confirmed — confirmation phrase not found", "WARN")
 
         return (confirmed, selected_time)
 
