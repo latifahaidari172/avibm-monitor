@@ -607,6 +607,16 @@ def run():
     active_customers = [c for c in customers if isinstance(c, dict) and c.get("active")]
     log(f"Found {len(active_customers)} active customer(s)")
 
+    # Safety reset — clear any stuck booking_in_progress flags at start of each run
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/vehicles?booking_in_progress=eq.true",
+            headers=HEADERS, json={"booking_in_progress": False}
+        )
+        log("Reset any stuck booking_in_progress flags")
+    except Exception as e:
+        log(f"Could not reset booking_in_progress flags: {e}", "WARN")
+
     if not active_customers:
         log("No active customers — nothing to do.")
         return
