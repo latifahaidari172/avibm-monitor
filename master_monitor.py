@@ -743,24 +743,28 @@ def run():
             try: driver.quit()
             except: pass
 
-        # Book in tier order with delays between tiers
-        # This ensures priority customers always get first attempt
-        current_tier = None
-        for customer, vehicle, dt, ds, loc, tier in booking_jobs:
-            # Apply delay when tier changes (except for first booking)
-            if current_tier is not None and tier != current_tier:
-                delay = TIER_DELAY.get(tier, 0)
-                if delay > 0:
-                    log(f"Tier change to {TIER_LABEL[tier]} — waiting {delay}s before booking...")
-                    time.sleep(delay)
-            current_tier = tier
+        def book_vehicle(customer, vehicle, dt, ds, loc, tier, delay=0):
+            """Book a single vehicle — runs in its own thread for parallel booking."""
+            if delay > 0:
+                log(f"[{TIER_LABEL[tier]}] Waiting {delay}s before booking (tier delay)...")
+                time.sleep(delay)
 
             log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
-            # Mark as in progress with timestamp so concurrent runs skip this vehicle
-            db_patch("vehicles", "id", vehicle["id"], {
-                "booking_in_progress": True,
-                "booking_started_at": datetime.now(timezone.utc).isoformat()
-            })
+
+            # Atomic claim — only one workflow can claim this vehicle at a time
+            claim_resp = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/vehicles?id=eq.{vehicle['id']}&booking_in_progress=eq.false",
+                headers={**HEADERS, "Prefer": "return=representation"},
+                json={
+                    "booking_in_progress": True,
+                    "booking_started_at": datetime.now(timezone.utc).isoformat()
+                }
+            )
+            claimed = claim_resp.json()
+            if not claimed or len(claimed) == 0:
+                log(f"  Could not claim vehicle — another workflow already booking it, skipping")
+                return
+            log(f"  ✓ Claimed vehicle for booking")
             result = qld_book_slot(loc, ds, customer, vehicle)
             confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
             if confirmed:
@@ -821,6 +825,33 @@ def run():
                 log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKING FAILED", ds)
                 log(f"  Booking failed for {customer['first_name']} {customer['last_name']}", "WARN")
                 db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False})
+
+        # Launch all booking jobs in parallel threads (one per vehicle)
+        # Priority customers get no delay, lower tiers get their delay applied inside the thread
+        threads = []
+        seen_tiers = {}
+        for job in booking_jobs:
+            customer, vehicle, dt, ds, loc, tier = job
+            # Calculate cumulative delay for this tier
+            delay = 0
+            if tier != 'priority':
+                delay = TIER_DELAY.get(tier, 0)
+            t = threading.Thread(
+                target=book_vehicle,
+                args=(customer, vehicle, dt, ds, loc, tier, delay),
+                daemon=True
+            )
+            threads.append(t)
+
+        # Start all threads simultaneously
+        for t in threads:
+            t.start()
+
+        # Wait for all bookings to complete before continuing
+        for t in threads:
+            t.join()
+
+        log(f"All booking threads completed")
 
     # ── SA: requests-based, no browser needed ────────────────────────────────
     if sa_customers:
