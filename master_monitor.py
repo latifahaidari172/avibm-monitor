@@ -372,14 +372,42 @@ def qld_book_slot(location, date_str, customer, vehicle):
         click_next(driver, wait)
         time.sleep(2)
 
+        # Click paperwork button (id="Paperwork", triggers checkDuplicateBooking)
+        try:
+            paperwork_btn = driver.find_element(By.XPATH,
+                "//button[@id='Paperwork' or @name='allPaperwork' or "
+                "contains(@data-ng-click,'checkDuplicateBooking')]")
+            driver.execute_script("arguments[0].click();", paperwork_btn)
+            log(f"  [BOOK] Clicked paperwork button")
+            time.sleep(1)
+        except Exception as e:
+            log(f"  [BOOK] Paperwork button not found: {e}", "WARN")
+
         # CAPTCHA
         log(f"  [BOOK] Solving CAPTCHA...")
         token = solve_captcha(QLD_CAPTCHA_KEY, QLD_BOOKING_URL)
         if not token: return False
 
-        driver.execute_script("var el=document.getElementById('g-recaptcha-response');if(el) el.innerHTML=arguments[0];", token)
-        driver.execute_script("var el=document.querySelector('[name=\"g-recaptcha-response\"]');if(el) el.value=arguments[0];", token)
-        time.sleep(1)
+        driver.execute_script("""
+            var token = arguments[0];
+            var el1 = document.getElementById('g-recaptcha-response');
+            if (el1) { el1.innerHTML = token; el1.value = token; }
+            var els = document.querySelectorAll('[name="g-recaptcha-response"]');
+            els.forEach(function(el) { el.innerHTML = token; el.value = token; });
+            try {
+                var cfg = window.___grecaptcha_cfg;
+                if (cfg && cfg.clients) {
+                    Object.keys(cfg.clients).forEach(function(key) {
+                        var client = cfg.clients[key];
+                        Object.keys(client).forEach(function(k) {
+                            var obj = client[k];
+                            if (obj && obj.callback) { try { obj.callback(token); } catch(e) {} }
+                        });
+                    });
+                }
+            } catch(e) {}
+        """, token)
+        time.sleep(2)
 
         log(f"  [BOOK] Clicking Submit My Booking Request...")
         click_next(driver, wait)
