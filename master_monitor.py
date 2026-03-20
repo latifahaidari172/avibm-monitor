@@ -260,10 +260,12 @@ def qld_book_slot(location, date_str, customer, vehicle):
     driver = make_driver()
     wait   = WebDriverWait(driver, 20)
     try:
+        log(f"  [BOOK] Loading WOVI page...")
         driver.get(QLD_BOOKING_URL)
         time.sleep(3)
 
         # Select location
+        log(f"  [BOOK] Selecting location: {location}")
         sel = wait.until(EC.presence_of_element_located((By.XPATH,
             "//select[.//option[contains(text(),'Brisbane')]]")))
         for opt in Select(sel).options:
@@ -272,13 +274,16 @@ def qld_book_slot(location, date_str, customer, vehicle):
         time.sleep(3)
 
         # Wait for calendar
+        log(f"  [BOOK] Waiting for calendar...")
         try:
             WebDriverWait(driver, 8).until(lambda d: len(
                 d.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']")) > 0)
         except TimeoutException:
-            return False
+            log(f"  [BOOK] Calendar did not load", "WARN")
+            return (False, "")
 
         # Click date
+        log(f"  [BOOK] Clicking date: {date_str}")
         clicked = False
         for item in driver.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']"):
             d = driver.execute_script(
@@ -287,8 +292,11 @@ def qld_book_slot(location, date_str, customer, vehicle):
             if d == date_str:
                 driver.execute_script("arguments[0].click();", item)
                 clicked = True; time.sleep(2); break
-        if not clicked: return False
+        if not clicked:
+            log(f"  [BOOK] Could not find date {date_str} on calendar", "WARN")
+            return (False, "")
 
+        log(f"  [BOOK] Selecting time slot...")
         # Select earliest time and capture it
         selected_time = ""
         try:
@@ -303,10 +311,12 @@ def qld_book_slot(location, date_str, customer, vehicle):
         except NoSuchElementException: pass
 
         time.sleep(1)
+        log(f"  [BOOK] Clicking Next (after time)...")
         click_next(driver, wait)
         time.sleep(3)
 
         # Vehicle details
+        log(f"  [BOOK] Filling vehicle details...")
         vtype = vehicle.get("vehicle_type","Car")
         try:
             driver.find_element(By.XPATH, f"//label[contains(normalize-space(.,'{vtype}')]")
@@ -326,10 +336,12 @@ def qld_book_slot(location, date_str, customer, vehicle):
         sel_by(driver, vehicle["purchase_method"],
                "//select[contains(@ng-model,'purchase') or contains(@name,'purchase')]")
 
+        log(f"  [BOOK] Clicking Next (after vehicle details)...")
         click_next(driver, wait)
         time.sleep(2)
 
         # Customer details
+        log(f"  [BOOK] Filling customer details...")
         fill(driver, customer["crn"],        "crn","CRN","licenceNumber","crnLicence")
         fill(driver, customer["first_name"], "firstName","first_name","fname")
         fill(driver, customer["last_name"],  "lastName","last_name","surname")
@@ -339,10 +351,12 @@ def qld_book_slot(location, date_str, customer, vehicle):
         fill(driver, customer["email"],      "email","emailAddress")
         fill(driver, customer["phone"],      "phone","mobile","mobileNumber")
 
+        log(f"  [BOOK] Clicking Next (after customer details)...")
         click_next(driver, wait)
         time.sleep(2)
 
         # CAPTCHA
+        log(f"  [BOOK] Solving CAPTCHA...")
         token = solve_captcha(QLD_CAPTCHA_KEY, QLD_BOOKING_URL)
         if not token: return False
 
@@ -350,8 +364,11 @@ def qld_book_slot(location, date_str, customer, vehicle):
         driver.execute_script("var el=document.querySelector('[name=\"g-recaptcha-response\"]');if(el) el.value=arguments[0];", token)
         time.sleep(1)
 
+        log(f"  [BOOK] Clicking Submit My Booking Request...")
         click_next(driver, wait)
         time.sleep(4)
+
+        log(f"  [BOOK] Page after submit: {driver.title}")
 
         # Handle "Would you like to update your booking?" popup — click "Update Booking"
         try:
@@ -401,26 +418,30 @@ def qld_book_slot(location, date_str, customer, vehicle):
         # After clicking Update Booking, wait for confirmation page
         time.sleep(4)
 
-        page_lower = driver.page_source.lower()
-        log(f"  Page after Update Booking: {driver.title}")
+        page_source = driver.page_source
+        page_lower  = page_source.lower()
+        page_title  = driver.title
+        page_url    = driver.current_url
+        log(f"  Page after final step: {page_title}")
+        log(f"  URL: {page_url}")
 
-        # Confirmation = any of these phrases on the page after the popup click
-        confirmed = any(w in page_lower for w in [
-            "booking has been secured",
-            "booking number",
-            "your booking reference",
-            "inspection has been booked",
-            "booking confirmation",
-            "confirmed",
-            "success",
-            "thank you",
-            "submitted",
-        ])
+        # Only confirm if WOVI shows a REAL booking confirmation
+        # Must contain "booking has been secured" OR a booking reference number
+        confirmed = (
+            "booking has been secured" in page_lower
+            or "your booking reference" in page_lower
+            or "inspection has been booked" in page_lower
+        )
+
+        # Log a snippet of the page to help debug
+        snippet = page_source[:500].replace("\n", " ").replace("\r", "")
+        log(f"  Page snippet: {snippet[:200]}")
 
         if confirmed:
-            log(f"  ✅ Booking confirmed!")
+            log(f"  ✅ Booking confirmed — WOVI confirmation phrase detected!")
         else:
-            log(f"  Booking NOT confirmed — page title: {driver.title}", "WARN")
+            log(f"  ❌ Booking NOT confirmed — WOVI confirmation phrase NOT found", "WARN")
+            log(f"  This may be a false positive — NOT marking as booked", "WARN")
 
         return (confirmed, selected_time)
 
