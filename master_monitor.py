@@ -4,7 +4,7 @@ AVIBM Master Monitor — runs for ALL active customers in the database.
 Fetches customers from Supabase, checks each vehicle, auto-books if earlier slot found.
 """
 
-import csv, json, os, re, smtplib, sys, time
+import csv, json, os, re, smtplib, sys, time, threading
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
