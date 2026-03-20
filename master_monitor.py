@@ -474,9 +474,23 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 "contains(@data-ng-click,'checkDuplicateBooking')]")
             driver.execute_script("arguments[0].click();", paperwork_btn)
             log(f"  [BOOK] Clicked paperwork button")
-            time.sleep(1)
+            time.sleep(2)
         except Exception as e:
             log(f"  [BOOK] Paperwork button not found: {e}", "WARN")
+
+        # Wait for reCAPTCHA widget to fully render before solving
+        log(f"  [BOOK] Waiting for reCAPTCHA to render...")
+        for _ in range(10):
+            has_captcha = driver.execute_script(
+                "return document.querySelector('.g-recaptcha, #g-recaptcha-response') !== null || "
+                "document.querySelector('iframe[src*=recaptcha]') !== null"
+            )
+            if has_captcha:
+                log(f"  [BOOK] reCAPTCHA widget detected")
+                break
+            time.sleep(1)
+        else:
+            log(f"  [BOOK] reCAPTCHA widget not found — proceeding anyway", "WARN")
 
         # CAPTCHA
         log(f"  [BOOK] Solving CAPTCHA...")
@@ -515,9 +529,8 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 angular.element(document.body).scope().$apply();
             } catch(e) {}
         """, token)
-        time.sleep(2)
-        log(f"  [BOOK] CAPTCHA token injected and callbacks fired")
-
+        # Submit immediately — no delay, token expires in ~2 mins
+        log(f"  [BOOK] CAPTCHA token injected — submitting immediately...")
         log(f"  [BOOK] Clicking Submit My Booking Request...")
         click_next(driver, wait)
         time.sleep(4)
