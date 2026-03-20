@@ -737,11 +737,11 @@ def run():
                                 from datetime import timezone as tz
                                 started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
                                 age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
-                                if age_mins < 10:
+                                if age_mins < 5:
                                     log(f"  Skipping {label} — booking in progress ({age_mins:.1f} min ago)")
                                     continue
                                 else:
-                                    log(f"  Resetting stale booking_in_progress for {label} ({age_mins:.1f} min old)")
+                                    log(f"  Resetting stale flag for {label} ({age_mins:.1f} min old — threshold 5 min)")
                                     db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
                             except Exception:
                                 log(f"  Skipping {label} — booking in progress (unknown age)")
