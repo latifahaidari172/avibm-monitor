@@ -606,7 +606,25 @@ def run():
                     log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
 
                     if slots:
-                        dt, ds, loc = slots[0]
+                        priority_locs = vehicle.get("priority_locations") or []
+
+                        # Try priority locations first (if they have the same earliest date)
+                        chosen = None
+                        if priority_locs:
+                            earliest_dt = slots[0][0]
+                            # Find slots on the earliest date at a priority location
+                            priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
+                            if priority_slots:
+                                chosen = priority_slots[0]
+                                log(f"  → Priority slot: {chosen[1]} at {chosen[2]}")
+                            else:
+                                # No priority location has the earliest date — use any earliest
+                                chosen = slots[0]
+                                log(f"  → No priority slot on {slots[0][1]} — using {chosen[2]}")
+                        else:
+                            chosen = slots[0]
+
+                        dt, ds, loc = chosen
                         log(f"  → Earlier slot: {ds} at {loc}")
                         booking_jobs.append((customer, vehicle, dt, ds, loc, tier))
 
