@@ -347,7 +347,19 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         # Customer details
         log(f"  [BOOK] Filling customer details...")
-        fill(driver, customer["crn"],        "qldCRN","crn","CRN","licenceNumber","crnLicence")
+        # CRN needs Angular-aware fill
+        try:
+            crn_el = driver.find_element(By.XPATH, "//input[@name='qldCRN' or @data-ng-model='vm.forms.customerDetails.qldCRN']")
+            crn_el.clear()
+            for char in str(customer["crn"]):
+                crn_el.send_keys(char)
+                time.sleep(0.05)
+            driver.execute_script(
+                "var el=arguments[0];"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "el.dispatchEvent(new Event('change',{bubbles:true}));", crn_el)
+        except Exception:
+            fill(driver, customer["crn"], "qldCRN","crn","CRN","licenceNumber","crnLicence")
         fill(driver, customer["first_name"], "firstName","first_name","fname")
         fill(driver, customer["last_name"],  "lastName","last_name","surname")
         fill(driver, customer["address"],    "address","streetAddress","street")
