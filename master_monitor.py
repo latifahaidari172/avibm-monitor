@@ -118,12 +118,14 @@ def log_result(customer_id, vehicle_id, state, location, result, detail=""):
 
 def make_driver():
     opts = Options()
-    opts.add_argument("--headless=new")
+    # Remove --headless so Angular behaves the same as local debug
+    # GitHub Actions uses Xvfb virtual display so this works fine
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,900")
     opts.add_argument("--log-level=3")
+    opts.add_argument("--display=:99")
     d = webdriver.Chrome(options=opts)
     d.set_page_load_timeout(30)
     return d
@@ -467,14 +469,15 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         # Handle "Would you like to update your booking?" popup
         clicked_popup = False
+        log(f"  Waiting for Update Booking popup (up to 20s)...")
         try:
-            WebDriverWait(driver, 12).until(
+            WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located((By.XPATH,
                     "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
                 ))
             )
             log("  Popup detected — triggering Update Booking via Angular")
-            time.sleep(1)
+            time.sleep(2)
 
             result = driver.execute_script("""
                 try {
@@ -487,12 +490,15 @@ def qld_book_slot(location, date_str, customer, vehicle):
             if result == 'triggered':
                 log("  ✓ Update Booking triggered via Angular")
                 clicked_popup = True
-                time.sleep(4)
+                time.sleep(5)
             else:
                 log(f"  triggerHandler failed: {result}", "WARN")
 
         except TimeoutException:
-            log("  No 'Update Booking' popup appeared — booking failed", "WARN")
+            log(f"  Popup not found after 20s — page title: {driver.title}", "WARN")
+            log(f"  Page URL: {driver.current_url}", "WARN")
+            # Log snippet to understand what page we're on
+            log(f"  Page source start: {driver.page_source[:200]}", "WARN")
 
         # Wait for confirmation page
         time.sleep(3)
