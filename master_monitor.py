@@ -183,17 +183,37 @@ def sel_by(driver, value, *xpaths):
     return False
 
 def click_next(driver, wait):
+    phrases = [
+        "submit my booking request",
+        "submit booking request",
+        "submit my booking",
+        "next",
+    ]
+    for phrase in phrases:
+        try:
+            btns = driver.find_elements(By.XPATH,
+                f"//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{phrase}')] | "
+                f"//input[@type='submit'][contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{phrase}')]"
+            )
+            for btn in btns:
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.5)
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(2)
+                    return True
+        except Exception:
+            continue
+    # Fallback to any submit button
     try:
-        btn = wait.until(EC.presence_of_element_located((By.XPATH,
-            "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'next')] | "
-            "//button[@type='submit'] | //input[@type='submit']"
-        )))
+        btn = driver.find_element(By.XPATH, "//button[@type='submit'] | //input[@type='submit']")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
         time.sleep(0.5)
         driver.execute_script("arguments[0].click();", btn)
         time.sleep(2)
         return True
-    except TimeoutException: return False
+    except Exception:
+        return False
 
 # ── QLD Monitor ───────────────────────────────────────────────────────────────
 
@@ -333,15 +353,75 @@ def qld_book_slot(location, date_str, customer, vehicle):
         click_next(driver, wait)
         time.sleep(4)
 
+        # Handle "Would you like to update your booking?" popup — click "Update Booking"
         try:
-            popup = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH,
-                "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]")))
-            driver.execute_script("arguments[0].click();", popup)
-            time.sleep(3)
-        except TimeoutException: pass
+            WebDriverWait(driver, 12).until(
+                EC.presence_of_element_located((By.XPATH,
+                    "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
+                ))
+            )
+            time.sleep(1)
+            log("  Popup detected — looking for 'Update Booking' button")
 
-        confirmed = any(w in driver.page_source.lower() for w in
-                        ["booking has been secured","booking number","confirmed","success","thank you","submitted"])
+            clicked_popup = False
+            # Try every possible element containing "update booking"
+            candidates = driver.find_elements(By.XPATH,
+                "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
+            )
+            for el in candidates:
+                try:
+                    if el.is_displayed():
+                        driver.execute_script("arguments[0].click();", el)
+                        log("  Clicked 'Update Booking' on popup")
+                        clicked_popup = True
+                        time.sleep(4)
+                        break
+                except Exception:
+                    continue
+
+            if not clicked_popup:
+                log("  Could not click 'Update Booking' — trying JS modal dismiss", "WARN")
+                # Try clicking any visible modal button as fallback
+                try:
+                    modal_btns = driver.find_elements(By.XPATH,
+                        "//div[contains(@class,'modal') or contains(@class,'dialog') or contains(@class,'popup')]//button"
+                    )
+                    for btn in modal_btns:
+                        if btn.is_displayed() and 'update' in btn.text.lower():
+                            driver.execute_script("arguments[0].click();", btn)
+                            log("  Clicked modal button via fallback")
+                            time.sleep(4)
+                            break
+                except Exception:
+                    pass
+
+        except TimeoutException:
+            log("  No 'Update Booking' popup appeared — continuing")
+
+        # After clicking Update Booking, wait for confirmation page
+        time.sleep(4)
+
+        page_lower = driver.page_source.lower()
+        log(f"  Page after Update Booking: {driver.title}")
+
+        # Confirmation = any of these phrases on the page after the popup click
+        confirmed = any(w in page_lower for w in [
+            "booking has been secured",
+            "booking number",
+            "your booking reference",
+            "inspection has been booked",
+            "booking confirmation",
+            "confirmed",
+            "success",
+            "thank you",
+            "submitted",
+        ])
+
+        if confirmed:
+            log(f"  ✅ Booking confirmed!")
+        else:
+            log(f"  Booking NOT confirmed — page title: {driver.title}", "WARN")
+
         return (confirmed, selected_time)
 
     except Exception as e:
