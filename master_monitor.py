@@ -643,15 +643,7 @@ def run():
     active_customers = [c for c in customers if isinstance(c, dict) and c.get("active")]
     log(f"Found {len(active_customers)} active customer(s)")
 
-    # Safety reset — clear any stuck booking_in_progress flags at start of each run
-    try:
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/vehicles?booking_in_progress=eq.true",
-            headers=HEADERS, json={"booking_in_progress": False}
-        )
-        log("Reset any stuck booking_in_progress flags")
-    except Exception as e:
-        log(f"Could not reset booking_in_progress flags: {e}", "WARN")
+    # Note: booking_in_progress flags are cleared by the booking attempt itself (success or failure)
 
     if not active_customers:
         log("No active customers — nothing to do.")
@@ -702,10 +694,26 @@ def run():
                     slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
                     log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
 
-                    # Skip if booking already in progress from a previous run
+                    # Skip if booking already in progress started less than 10 minutes ago
                     if vehicle.get("booking_in_progress"):
-                        log(f"  Skipping {label} — booking already in progress")
-                        continue
+                        started_at = vehicle.get("booking_started_at")
+                        if started_at:
+                            try:
+                                from datetime import timezone as tz
+                                started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                                age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+                                if age_mins < 10:
+                                    log(f"  Skipping {label} — booking in progress ({age_mins:.1f} min ago)")
+                                    continue
+                                else:
+                                    log(f"  Resetting stale booking_in_progress for {label} ({age_mins:.1f} min old)")
+                                    db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
+                            except Exception:
+                                log(f"  Skipping {label} — booking in progress (unknown age)")
+                                continue
+                        else:
+                            log(f"  Skipping {label} — booking already in progress")
+                            continue
 
                     if slots:
                         priority_locs = vehicle.get("priority_locations") or []
@@ -748,8 +756,11 @@ def run():
             current_tier = tier
 
             log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
-            # Mark as in progress so concurrent runs don't try the same booking
-            db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": True})
+            # Mark as in progress with timestamp so concurrent runs skip this vehicle
+            db_patch("vehicles", "id", vehicle["id"], {
+                "booking_in_progress": True,
+                "booking_started_at": datetime.now(timezone.utc).isoformat()
+            })
             result = qld_book_slot(loc, ds, customer, vehicle)
             confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
             if confirmed:
