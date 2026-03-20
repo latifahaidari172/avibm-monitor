@@ -252,15 +252,36 @@ def qld_find_slots(driver, cutoff, label, locations=None):
             except TimeoutException:
                 log(f"  {label} / {location}: calendar timeout"); continue
 
-            for item in driver.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']"):
+            # Wait for Angular to populate availability data
+            time.sleep(3)
+            cells = driver.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']")
+            for item in cells:
                 try:
-                    d = driver.execute_script(
-                        "try{var s=angular.element(arguments[0]).scope();"
-                        "if(!s||!s.day||!s.day.available||!s.day.thisMonth) return null;"
-                        "return s.day.value;}catch(e){return null;}", item)
-                    if not d: continue
-                    dt = parse_date(d)
-                    if dt and dt < cutoff: slots.append((dt, d, location))
+                    data = driver.execute_script("""
+                        try {
+                            var el = arguments[0];
+                            var s = angular.element(el).scope();
+                            var av = s && s.day ? s.day.available : null;
+                            var val = s && s.day ? s.day.value : null;
+                            var inMonth = s && s.day ? s.day.thisMonth : null;
+                            var cls = el.className || '';
+                            var cssAvail = cls.includes('available') && !cls.includes('unavailable') && !cls.includes('disabled');
+                            var cssInMonth = !cls.includes('other-month') && !cls.includes('prev-month') && !cls.includes('next-month');
+                            return {av: av, val: val, inMonth: inMonth, cssAvail: cssAvail, cssInMonth: cssInMonth};
+                        } catch(e) { return null; }
+                    """, item)
+                    if not data or not data.get('val'): continue
+                    val = data['val']
+                    av = data.get('av')
+                    inMonth = data.get('inMonth')
+                    cssAvail = data.get('cssAvail')
+                    cssInMonth = data.get('cssInMonth')
+                    # Use Angular if available, fallback to CSS
+                    use_av = av if av is not None else cssAvail
+                    use_in = inMonth if inMonth is not None else cssInMonth
+                    if use_av and use_in:
+                        dt = parse_date(val)
+                        if dt and dt < cutoff: slots.append((dt, val, location))
                 except: continue
 
             found = sum(1 for s in slots if s[2] == location)
