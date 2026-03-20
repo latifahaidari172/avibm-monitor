@@ -132,20 +132,25 @@ def make_driver():
 
 # ── 2captcha ──────────────────────────────────────────────────────────────────
 
-def solve_captcha(site_key, page_url, retries=2):
+def solve_captcha(site_key, page_url, retries=3):
     """Solve reCAPTCHA via 2captcha with retries on failure."""
     for attempt in range(retries):
         try:
             if attempt > 0:
                 log(f"  CAPTCHA retry {attempt}/{retries-1}...")
+                time.sleep(5)
             r = requests.post("http://2captcha.com/in.php", data={
                 "key": TWOCAPTCHA_KEY, "method": "userrecaptcha",
                 "googlekey": site_key, "pageurl": page_url, "json": 1,
-            }, timeout=30).json()
-            if r.get("status") != 1:
-                log(f"  CAPTCHA submit failed: {r.get('request')}", "WARN")
+            }, timeout=30)
+            if not r.text.strip():
+                log(f"  CAPTCHA submit returned empty response", "WARN")
                 continue
-            cid = r["request"]
+            r_json = r.json()
+            if r_json.get("status") != 1:
+                log(f"  CAPTCHA submit failed: {r_json.get('request')}", "WARN")
+                continue
+            cid = r_json["request"]
             log(f"  CAPTCHA submitted (ID: {cid})")
             for _ in range(30):  # up to 150 seconds
                 time.sleep(5)
@@ -153,19 +158,24 @@ def solve_captcha(site_key, page_url, retries=2):
                     resp = requests.get("http://2captcha.com/res.php", params={
                         "key": TWOCAPTCHA_KEY, "action": "get", "id": cid, "json": 1
                     }, timeout=10)
+                    if not resp.text.strip():
+                        continue  # empty response, keep waiting
                     try:
                         p = resp.json()
                         if p.get("status") == 1:
                             log("  CAPTCHA solved!")
                             return p["request"]
-                        if p.get("request") != "CAPCHA_NOT_READY":
-                            log(f"  CAPTCHA error: {p.get('request')}", "WARN")
-                            break  # try again
+                        req = p.get("request","")
+                        if req not in ("CAPCHA_NOT_READY", ""):
+                            log(f"  CAPTCHA error: {req}", "WARN")
+                            break
                     except:
                         t = resp.text.strip()
                         if t.startswith("OK|"): return t[3:]
-                        if t != "CAPCHA_NOT_READY": break
-                except: continue
+                        if t and t != "CAPCHA_NOT_READY": break
+                except Exception as e:
+                    log(f"  CAPTCHA poll error: {e}", "WARN")
+                    continue
         except Exception as e:
             log(f"  CAPTCHA exception: {e}", "WARN")
     log("  CAPTCHA failed after all retries", "WARN")
@@ -420,18 +430,30 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         # Customer details
         log(f"  [BOOK] Filling customer details...")
-        # CRN needs Angular-aware fill
+        # CRN — use nativeInputValueSetter to bypass Angular validation
         try:
-            crn_el = driver.find_element(By.XPATH, "//input[@name='qldCRN' or @data-ng-model='vm.forms.customerDetails.qldCRN']")
-            crn_el.clear()
-            for char in str(customer["crn"]):
-                crn_el.send_keys(char)
-                time.sleep(0.05)
-            driver.execute_script(
-                "var el=arguments[0];"
-                "el.dispatchEvent(new Event('input',{bubbles:true}));"
-                "el.dispatchEvent(new Event('change',{bubbles:true}));", crn_el)
-        except Exception:
+            crn_el = driver.find_element(By.XPATH, "//input[@name='qldCRN']")
+            driver.execute_script("""
+                var el = arguments[0];
+                var val = arguments[1];
+                el.focus();
+                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                try {
+                    var scope = angular.element(el).scope();
+                    if (scope && scope.vm && scope.vm.forms && scope.vm.forms.customerDetails) {
+                        scope.vm.forms.customerDetails.qldCRN = val;
+                        scope.$apply();
+                    }
+                } catch(e) {}
+            """, crn_el, str(customer["crn"]))
+            time.sleep(0.5)
+            log(f"  [BOOK] CRN filled: {crn_el.get_attribute('value')}")
+        except Exception as e:
+            log(f"  [BOOK] CRN error: {e}", "WARN")
             fill(driver, customer["crn"], "qldCRN","crn","CRN","licenceNumber","crnLicence")
         fill(driver, customer["first_name"], "firstName","first_name","fname")
         fill(driver, customer["last_name"],  "lastName","last_name","surname")
@@ -463,10 +485,13 @@ def qld_book_slot(location, date_str, customer, vehicle):
 
         driver.execute_script("""
             var token = arguments[0];
+            // Set token in all response fields
             var el1 = document.getElementById('g-recaptcha-response');
-            if (el1) { el1.innerHTML = token; el1.value = token; }
-            var els = document.querySelectorAll('[name="g-recaptcha-response"]');
-            els.forEach(function(el) { el.innerHTML = token; el.value = token; });
+            if (el1) { el1.innerHTML = token; el1.value = token; el1.style.display = 'block'; }
+            document.querySelectorAll('[name="g-recaptcha-response"]').forEach(function(el) {
+                el.innerHTML = token; el.value = token;
+            });
+            // Fire grecaptcha callbacks
             try {
                 var cfg = window.___grecaptcha_cfg;
                 if (cfg && cfg.clients) {
@@ -474,13 +499,24 @@ def qld_book_slot(location, date_str, customer, vehicle):
                         var client = cfg.clients[key];
                         Object.keys(client).forEach(function(k) {
                             var obj = client[k];
-                            if (obj && obj.callback) { try { obj.callback(token); } catch(e) {} }
+                            if (obj && typeof obj.callback === 'function') {
+                                try { obj.callback(token); } catch(e) {}
+                            }
+                            // Also try l, m, n etc (grecaptcha internal keys)
+                            if (obj && obj.l && typeof obj.l === 'function') {
+                                try { obj.l(token); } catch(e) {}
+                            }
                         });
                     });
                 }
             } catch(e) {}
+            // Trigger Angular digest
+            try {
+                angular.element(document.body).scope().$apply();
+            } catch(e) {}
         """, token)
         time.sleep(2)
+        log(f"  [BOOK] CAPTCHA token injected and callbacks fired")
 
         log(f"  [BOOK] Clicking Submit My Booking Request...")
         click_next(driver, wait)
