@@ -453,58 +453,105 @@ def qld_book_slot(location, date_str, customer, vehicle):
         log(f"  [BOOK] Clicking Next (after customer details)...")
         click_next(driver, wait)
         time.sleep(3)
-        # Try multiple strategies to find paperwork button — critical for popup to appear
+
+        # Debug — log current page state after clicking Next
+        page_state = driver.execute_script("""
+            try {
+                var btns = [];
+                document.querySelectorAll('button').forEach(function(b){
+                    btns.push((b.id||'') + '|' + (b.getAttribute('ng-click')||b.getAttribute('data-ng-click')||'') + '|' + b.textContent.trim().substring(0,20));
+                });
+                var url = window.location.href;
+                var title = document.title;
+                var bodySnippet = document.body.innerText.substring(0, 200);
+                return {url: url, title: title, buttons: btns, body: bodySnippet};
+            } catch(e){ return {error: e.toString()}; }
+        """)
+        log(f"  [BOOK] After Next — URL: {page_state.get('url','?')}")
+        log(f"  [BOOK] After Next — Buttons: {page_state.get('buttons','?')}")
+        log(f"  [BOOK] After Next — Body: {page_state.get('body','?')[:150]}")
+
+
+        # Click paperwork checkbox — it's a checkbox input, not a button
+        # This triggers checkDuplicateBooking which makes the Update Booking popup appear
         paperwork_clicked = False
+
+        # Strategy 1 — find checkbox by id/name/ng-click
         try:
-            paperwork_btn = driver.find_element(By.XPATH,
-                "//button[@id='Paperwork' or @name='allPaperwork' or "
-                "contains(@data-ng-click,'checkDuplicateBooking') or "
+            checkbox = driver.find_element(By.XPATH,
+                "//input[@type='checkbox' and ("
+                "@id='Paperwork' or @name='allPaperwork' or @name='paperwork' or "
                 "contains(@ng-click,'checkDuplicateBooking') or "
                 "contains(@ng-click,'Paperwork') or "
-                "contains(@data-ng-click,'Paperwork')]")
-            driver.execute_script("arguments[0].click();", paperwork_btn)
-            log(f"  [BOOK] Clicked paperwork button (xpath strategy)")
+                "contains(@ng-model,'paperwork') or "
+                "contains(@ng-model,'Paperwork'))]")
+            if not checkbox.is_selected():
+                driver.execute_script("arguments[0].click();", checkbox)
+            log(f"  [BOOK] Ticked paperwork checkbox (xpath strategy)")
             paperwork_clicked = True
             time.sleep(2)
         except Exception:
             pass
 
+        # Strategy 2 — find any unchecked checkbox on the page and tick it
         if not paperwork_clicked:
             result = driver.execute_script("""
                 try {
-                    var btns = document.querySelectorAll('button');
-                    var allInfo = [];
-                    for(var i=0;i<btns.length;i++){
-                        var ngc = btns[i].getAttribute('ng-click') || btns[i].getAttribute('data-ng-click') || '';
-                        var bid = btns[i].id || '';
-                        allInfo.push(bid + '|' + ngc + '|' + btns[i].textContent.trim().substring(0,30));
-                        if(ngc.toLowerCase().includes('paperwork') || ngc.toLowerCase().includes('duplicate') || bid === 'Paperwork'){
-                            btns[i].click();
-                            return 'clicked:' + bid + '|' + ngc;
+                    // Log all checkboxes so we can see what's on the page
+                    var checks = document.querySelectorAll('input[type=checkbox]');
+                    var checkInfo = [];
+                    for(var i=0;i<checks.length;i++){
+                        var c = checks[i];
+                        var info = {
+                            id: c.id, name: c.name,
+                            ngclick: c.getAttribute('ng-click') || c.getAttribute('data-ng-click') || '',
+                            ngmodel: c.getAttribute('ng-model') || c.getAttribute('data-ng-model') || '',
+                            checked: c.checked, visible: c.offsetParent !== null
+                        };
+                        checkInfo.push(info);
+                        // Click if it looks like the paperwork checkbox
+                        var combined = (info.id + info.name + info.ngclick + info.ngmodel).toLowerCase();
+                        if(combined.includes('paperwork') || combined.includes('duplicate') || combined.includes('allpaper')){
+                            if(!c.checked) c.click();
+                            c.dispatchEvent(new Event('change', {bubbles:true}));
+                            return 'clicked-checkbox:' + JSON.stringify(info);
                         }
                     }
-                    // Try Angular scope directly
+
+                    // Strategy 3 — if only one checkbox on page, it's probably the paperwork one
+                    var visibleChecks = Array.from(checks).filter(function(c){ return c.offsetParent !== null; });
+                    if(visibleChecks.length === 1){
+                        if(!visibleChecks[0].checked) visibleChecks[0].click();
+                        visibleChecks[0].dispatchEvent(new Event('change', {bubbles:true}));
+                        return 'clicked-only-visible-checkbox';
+                    }
+
+                    // Strategy 4 — call Angular scope method directly
                     try {
                         var scope = angular.element(document.body).scope();
-                        if(scope && scope.vm && typeof scope.vm.checkDuplicateBooking === 'function'){
-                            scope.vm.checkDuplicateBooking(); scope.$apply();
-                            return 'scope:checkDuplicateBooking';
-                        }
-                        if(scope && scope.vm && typeof scope.vm.allPaperwork === 'function'){
-                            scope.vm.allPaperwork(); scope.$apply();
-                            return 'scope:allPaperwork';
+                        if(scope && scope.vm){
+                            if(typeof scope.vm.checkDuplicateBooking === 'function'){
+                                scope.vm.checkDuplicateBooking(); scope.$apply();
+                                return 'scope:checkDuplicateBooking';
+                            }
+                            if(typeof scope.vm.allPaperwork === 'function'){
+                                scope.vm.allPaperwork(); scope.$apply();
+                                return 'scope:allPaperwork';
+                            }
                         }
                     } catch(e2){}
-                    return 'not-found|all-buttons:' + JSON.stringify(allInfo);
-                } catch(e){ return 'error:'+e.toString(); }
+
+                    return 'not-found|checkboxes:' + JSON.stringify(checkInfo);
+                } catch(e){ return 'error:' + e.toString(); }
             """)
-            log(f"  [BOOK] Paperwork JS result: {str(result)[:200]}")
+            log(f"  [BOOK] Paperwork JS result: {str(result)[:300]}")
             if result and 'not-found' not in str(result) and 'error' not in str(result):
                 paperwork_clicked = True
             time.sleep(2)
 
         if not paperwork_clicked:
-            log(f"  [BOOK] WARNING — could not click paperwork button", "WARN")
+            log(f"  [BOOK] WARNING — could not tick paperwork checkbox", "WARN")
+
 
         log(f"  [BOOK] Waiting for reCAPTCHA to render...")
         for _ in range(10):
