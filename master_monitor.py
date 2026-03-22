@@ -509,39 +509,99 @@ def qld_book_slot(location, date_str, customer, vehicle):
         time.sleep(4)
         log(f"  [BOOK] Page after submit: {driver.title}")
         clicked_popup = False
-        log(f"  Waiting for Update Booking popup (up to 20s)...")
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.XPATH,
-                    "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'update booking')]"
-                ))
-            )
-            log("  Popup detected — triggering Update Booking via Angular")
-            time.sleep(2)
+        log(f"  Waiting for Update Booking popup (up to 30s)...")
+
+        # Log current page source snippet to understand what appeared after submit
+        time.sleep(3)
+        snippet = driver.page_source[:2000].lower()
+        log(f"  [DEBUG] Page snippet after submit: {snippet[:500]}")
+
+        # Strategy 1 — check if booking already confirmed without a popup
+        page_lower = driver.page_source.lower()
+        already_confirmed = any(w in page_lower for w in [
+            "booking has been secured", "your booking reference",
+            "inspection has been booked", "booking confirmed",
+            "successfully booked", "thank you for your booking"
+        ])
+        if already_confirmed:
+            log("  ✅ Booking confirmed directly (no popup needed)!")
+            return (True, selected_time)
+
+        # Strategy 2 — wait for popup with broader search terms
+        popup_found = False
+        for _ in range(30):  # poll every 1s for 30s
+            try:
+                src = driver.page_source.lower()
+                if any(w in src for w in ["update booking", "move booking", "earlier booking",
+                                           "would you like", "movebooking", "updatbooking"]):
+                    popup_found = True
+                    break
+                # Also check if confirmation already appeared while waiting
+                if any(w in src for w in ["booking has been secured", "your booking reference",
+                                           "successfully booked", "thank you for your booking"]):
+                    log("  ✅ Booking confirmed while waiting for popup!")
+                    return (True, selected_time)
+            except: pass
+            time.sleep(1)
+
+        if popup_found:
+            log("  Popup detected — trying all click strategies...")
+            time.sleep(1)
+
+            # Try multiple ways to click the confirm button
             result = driver.execute_script("""
                 try {
+                    // Strategy A — ng-click attribute
                     var btn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
-                    if (btn) { angular.element(btn).triggerHandler('click'); return 'triggered'; }
-                    return 'not found';
-                } catch(e) { return 'error: ' + e.toString(); }
+                    if (btn) { angular.element(btn).triggerHandler('click'); return 'A:triggered'; }
+
+                    // Strategy B — any button containing 'update' or 'move' or 'yes'
+                    var btns = document.querySelectorAll('button, a, input[type=button], input[type=submit]');
+                    for (var i = 0; i < btns.length; i++) {
+                        var t = (btns[i].textContent || btns[i].value || '').toLowerCase();
+                        if (t.includes('update') || t.includes('move') || t.includes('yes') || t.includes('confirm')) {
+                            btns[i].click();
+                            return 'B:clicked:' + t.trim();
+                        }
+                    }
+
+                    // Strategy C — Angular scope method directly
+                    try {
+                        var scope = angular.element(document.body).scope();
+                        if (scope && scope.vm && scope.vm.dialog && scope.vm.dialog.moveBooking) {
+                            scope.vm.dialog.moveBooking();
+                            scope.$apply();
+                            return 'C:scope-called';
+                        }
+                    } catch(e) {}
+
+                    return 'no-button-found';
+                } catch(e) { return 'error:' + e.toString(); }
             """)
-            log(f"  triggerHandler result: {result}")
-            if result == 'triggered':
-                log("  ✓ Update Booking triggered via Angular")
+            log(f"  Popup click result: {result}")
+            if result and result not in ['no-button-found'] and not result.startswith('error'):
                 clicked_popup = True
-                time.sleep(5)
-        except TimeoutException:
-            log(f"  Popup not found after 20s", "WARN")
+                time.sleep(6)
+        else:
+            log(f"  Popup not found after 30s — checking if booking went through anyway", "WARN")
+
+        # Final confirmation check
         time.sleep(3)
         page_lower = driver.page_source.lower()
-        confirmed = clicked_popup and any(w in page_lower for w in [
+        log(f"  [DEBUG] Final page title: {driver.title}")
+        log(f"  [DEBUG] Final URL: {driver.current_url}")
+
+        confirmed = (clicked_popup or not popup_found) and any(w in page_lower for w in [
             "booking has been secured", "your booking reference",
-            "inspection has been booked", "confirmed", "success", "thank you"
+            "inspection has been booked", "booking confirmed",
+            "successfully booked", "thank you for your booking",
+            "confirmed", "success", "thank you"
         ])
         if confirmed:
             log(f"  ✅ Booking confirmed!")
         else:
-            log(f"  ❌ Booking NOT confirmed", "WARN")
+            log(f"  ❌ Booking NOT confirmed — page title: {driver.title}", "WARN")
+            log(f"  [DEBUG] Page source sample: {page_lower[:300]}", "WARN")
         return (confirmed, selected_time)
     except Exception as e:
         log(f"QLD booking error: {e}", "ERROR"); return (False, "")
