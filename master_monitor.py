@@ -511,14 +511,18 @@ def qld_book_slot(location, date_str, customer, vehicle):
         clicked_popup = False
         log(f"  Waiting for Update Booking popup (up to 30s)...")
 
-        # Log current page source snippet to understand what appeared after submit
+        # Dump full page source so we can find the real confirmation text
         time.sleep(3)
-        snippet = driver.page_source[:2000].lower()
-        log(f"  [DEBUG] Page snippet after submit: {snippet[:500]}")
+        full_source = driver.page_source
+        full_lower = full_source.lower()
+        log(f"  [DEBUG] Page title after submit: {driver.title}")
+        log(f"  [DEBUG] Page URL after submit: {driver.current_url}")
+        log(f"  [DEBUG] Full page source ({len(full_source)} chars) — printing in chunks:")
+        for i in range(0, min(len(full_source), 6000), 600):
+            log(f"  [DEBUG] [{i}] {full_source[i:i+600]}")
 
         # Strategy 1 — check if booking already confirmed without a popup
-        page_lower = driver.page_source.lower()
-        already_confirmed = any(w in page_lower for w in [
+        already_confirmed = any(w in full_lower for w in [
             "booking has been secured", "your booking reference",
             "inspection has been booked", "booking confirmed",
             "successfully booked", "thank you for your booking"
