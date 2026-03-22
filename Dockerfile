@@ -57,8 +57,8 @@ COPY . .
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-# Add crontab — runs bot every 1 minute
-RUN echo "* * * * * cd /app && DISPLAY=:99 python master_monitor.py >> /var/log/avibm.log 2>&1" \
+# Add crontab — runs bot every 1 minute (python3 not python)
+RUN echo "* * * * * cd /app && DISPLAY=:99 python3 master_monitor.py >> /var/log/avibm.log 2>&1" \
     > /etc/cron.d/avibm && \
     chmod 0644 /etc/cron.d/avibm && \
     crontab /etc/cron.d/avibm
