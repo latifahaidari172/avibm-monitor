@@ -915,7 +915,16 @@ def run():
                     driver.get(QLD_BOOKING_URL)
                     time.sleep(3)
                     vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
+                    # Apply search_after_date if active (admin test feature)
+                    search_after = None
+                    if vehicle.get("search_after_active") and vehicle.get("search_after_date"):
+                        search_after = parse_date(vehicle["search_after_date"])
+                        log(f"  [SCAN] Search after date active: only slots after {search_after.strftime('%d/%m/%Y')}")
                     slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
+                    # Filter out slots before search_after_date if set
+                    if search_after:
+                        slots = [(dt, ds, loc) for dt, ds, loc in slots if dt > search_after]
+                        log(f"  [SCAN] After filtering by search_after: {len(slots)} slot(s) remain")
                     log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
                     if slots:
                         priority_locs = vehicle.get("priority_locations") or []
