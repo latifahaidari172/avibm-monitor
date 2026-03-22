@@ -452,16 +452,60 @@ def qld_book_slot(location, date_str, customer, vehicle):
         fill(driver, customer["phone"],      "phone","mobile","mobileNumber")
         log(f"  [BOOK] Clicking Next (after customer details)...")
         click_next(driver, wait)
-        time.sleep(2)
+        time.sleep(3)
+        # Try multiple strategies to find paperwork button — critical for popup to appear
+        paperwork_clicked = False
         try:
             paperwork_btn = driver.find_element(By.XPATH,
                 "//button[@id='Paperwork' or @name='allPaperwork' or "
-                "contains(@data-ng-click,'checkDuplicateBooking')]")
+                "contains(@data-ng-click,'checkDuplicateBooking') or "
+                "contains(@ng-click,'checkDuplicateBooking') or "
+                "contains(@ng-click,'Paperwork') or "
+                "contains(@data-ng-click,'Paperwork')]")
             driver.execute_script("arguments[0].click();", paperwork_btn)
-            log(f"  [BOOK] Clicked paperwork button")
+            log(f"  [BOOK] Clicked paperwork button (xpath strategy)")
+            paperwork_clicked = True
             time.sleep(2)
-        except Exception as e:
-            log(f"  [BOOK] Paperwork button not found: {e}", "WARN")
+        except Exception:
+            pass
+
+        if not paperwork_clicked:
+            result = driver.execute_script("""
+                try {
+                    var btns = document.querySelectorAll('button');
+                    var allInfo = [];
+                    for(var i=0;i<btns.length;i++){
+                        var ngc = btns[i].getAttribute('ng-click') || btns[i].getAttribute('data-ng-click') || '';
+                        var bid = btns[i].id || '';
+                        allInfo.push(bid + '|' + ngc + '|' + btns[i].textContent.trim().substring(0,30));
+                        if(ngc.toLowerCase().includes('paperwork') || ngc.toLowerCase().includes('duplicate') || bid === 'Paperwork'){
+                            btns[i].click();
+                            return 'clicked:' + bid + '|' + ngc;
+                        }
+                    }
+                    // Try Angular scope directly
+                    try {
+                        var scope = angular.element(document.body).scope();
+                        if(scope && scope.vm && typeof scope.vm.checkDuplicateBooking === 'function'){
+                            scope.vm.checkDuplicateBooking(); scope.$apply();
+                            return 'scope:checkDuplicateBooking';
+                        }
+                        if(scope && scope.vm && typeof scope.vm.allPaperwork === 'function'){
+                            scope.vm.allPaperwork(); scope.$apply();
+                            return 'scope:allPaperwork';
+                        }
+                    } catch(e2){}
+                    return 'not-found|all-buttons:' + JSON.stringify(allInfo);
+                } catch(e){ return 'error:'+e.toString(); }
+            """)
+            log(f"  [BOOK] Paperwork JS result: {str(result)[:200]}")
+            if result and 'not-found' not in str(result) and 'error' not in str(result):
+                paperwork_clicked = True
+            time.sleep(2)
+
+        if not paperwork_clicked:
+            log(f"  [BOOK] WARNING — could not click paperwork button", "WARN")
+
         log(f"  [BOOK] Waiting for reCAPTCHA to render...")
         for _ in range(10):
             has_captcha = driver.execute_script(
