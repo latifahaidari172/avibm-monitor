@@ -479,30 +479,38 @@ def qld_book_slot(location, date_str, customer, vehicle):
         except Exception as e:
             log(f"  [BOOK] CRN field not found: {e}", "WARN")
 
-        # Fill remaining fields using ActionChains-based fill
+        # Fill remaining fields using JS setter (most reliable for Angular forms)
+        def js_fill(selector_name, value):
+            """Fill field using JS native setter — works even when element not interactable."""
+            result = driver.execute_script("""
+                var name = arguments[0]; var val = arguments[1];
+                var el = document.querySelector('[name="'+name+'"]') ||
+                         document.querySelector('[id="'+name+'"]') ||
+                         document.querySelector('[ng-model*="'+name+'"]');
+                if(!el) return 'not-found:'+name;
+                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                try{ angular.element(el).scope().$apply(); }catch(e){}
+                return 'ok:'+el.value;
+            """, selector_name, str(value))
+            return result
+
         fields = [
-            ("first_name", ["firstName","first_name","fname"]),
-            ("last_name",  ["lastName","last_name","surname"]),
-            ("address",    ["address","streetAddress","street"]),
-            ("suburb",     ["suburb","city"]),
-            ("postcode",   ["postcode","zipCode"]),
-            ("email",      ["email","emailAddress"]),
-            ("phone",      ["phone","mobile","mobileNumber"]),
+            ("firstName",  customer.get("first_name","")),
+            ("lastName",   customer.get("last_name","")),
+            ("address",    customer.get("address","")),
+            ("suburb",     customer.get("suburb","")),
+            ("postcode",   customer.get("postcode","")),
+            ("email",      customer.get("email","")),
+            ("phone",      customer.get("phone","")),
         ]
-        for field_key, names in fields:
-            value = customer.get(field_key, "")
-            if not value: continue
-            filled = False
-            for name in names:
-                for attr in ["name","id","ng-model"]:
-                    try:
-                        el = driver.find_element(By.XPATH, f"//input[@{attr}='{name}']")
-                        if el.is_displayed():
-                            fill_angular(el, value)
-                            filled = True
-                            break
-                    except: pass
-                if filled: break
+        for fname, fval in fields:
+            if fval:
+                r = js_fill(fname, fval)
+                log(f"  [BOOK] {fname}: {r}")
 
         # Verify all fields before clicking Next
         verification = driver.execute_script("""
