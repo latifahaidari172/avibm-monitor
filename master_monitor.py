@@ -422,34 +422,102 @@ def qld_book_slot(location, date_str, customer, vehicle):
         click_next(driver, wait)
         time.sleep(2)
         log(f"  [BOOK] Filling customer details...")
+
+        def fill_angular(el, value):
+            """Fill an Angular input using ActionChains for reliable validation triggering."""
+            from selenium.webdriver.common.action_chains import ActionChains
+            from selenium.webdriver.common.keys import Keys
+            try:
+                # Click to focus, clear, type character by character
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+                time.sleep(0.2)
+                # Clear existing value
+                el.send_keys(Keys.CONTROL + "a")
+                el.send_keys(Keys.DELETE)
+                time.sleep(0.1)
+                # Type each character
+                for char in str(value):
+                    el.send_keys(char)
+                    time.sleep(0.05)
+                # Trigger Angular validation events
+                driver.execute_script("""
+                    var el = arguments[0];
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                    el.dispatchEvent(new Event('blur', {bubbles:true}));
+                    try {
+                        var scope = angular.element(el).scope();
+                        if(scope) scope.$apply();
+                    } catch(e){}
+                """, el)
+                time.sleep(0.2)
+                return True
+            except Exception as e:
+                log(f"  fill_angular error: {e}", "WARN")
+                return False
+
+        # Fill CRN — most critical field for form validation
+        crn_filled = False
         try:
-            crn_el = driver.find_element(By.XPATH, "//input[@name='qldCRN']")
-            driver.execute_script("""
-                var el = arguments[0]; var val = arguments[1];
-                el.focus();
-                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new Event('blur', {bubbles: true}));
-                try {
-                    var scope = angular.element(el).scope();
-                    if (scope && scope.vm && scope.vm.forms && scope.vm.forms.customerDetails) {
-                        scope.vm.forms.customerDetails.qldCRN = val; scope.$apply();
-                    }
-                } catch(e) {}
-            """, crn_el, str(customer["crn"]))
-            time.sleep(0.5)
+            crn_el = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@name='qldCRN']")))
+            crn_filled = fill_angular(crn_el, str(customer["crn"]))
+            actual_val = crn_el.get_attribute("value")
+            log(f"  [BOOK] CRN filled: '{actual_val}' (expected: '{customer['crn']}')")
+            if actual_val != str(customer["crn"]):
+                log(f"  [BOOK] CRN mismatch — retrying with JS setter", "WARN")
+                driver.execute_script("""
+                    var el=arguments[0]; var val=arguments[1];
+                    var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+                    setter.call(el,val);
+                    el.dispatchEvent(new Event('input',{bubbles:true}));
+                    el.dispatchEvent(new Event('change',{bubbles:true}));
+                    el.dispatchEvent(new Event('blur',{bubbles:true}));
+                    try{angular.element(el).scope().$apply();}catch(e){}
+                """, crn_el, str(customer["crn"]))
         except Exception as e:
-            log(f"  [BOOK] CRN error: {e}", "WARN")
-            fill(driver, customer["crn"], "qldCRN","crn","CRN","licenceNumber","crnLicence")
-        fill(driver, customer["first_name"], "firstName","first_name","fname")
-        fill(driver, customer["last_name"],  "lastName","last_name","surname")
-        fill(driver, customer["address"],    "address","streetAddress","street")
-        fill(driver, customer["suburb"],     "suburb","city")
-        fill(driver, customer["postcode"],   "postcode","zipCode")
-        fill(driver, customer["email"],      "email","emailAddress")
-        fill(driver, customer["phone"],      "phone","mobile","mobileNumber")
+            log(f"  [BOOK] CRN field not found: {e}", "WARN")
+
+        # Fill remaining fields using ActionChains-based fill
+        fields = [
+            ("first_name", ["firstName","first_name","fname"]),
+            ("last_name",  ["lastName","last_name","surname"]),
+            ("address",    ["address","streetAddress","street"]),
+            ("suburb",     ["suburb","city"]),
+            ("postcode",   ["postcode","zipCode"]),
+            ("email",      ["email","emailAddress"]),
+            ("phone",      ["phone","mobile","mobileNumber"]),
+        ]
+        for field_key, names in fields:
+            value = customer.get(field_key, "")
+            if not value: continue
+            filled = False
+            for name in names:
+                for attr in ["name","id","ng-model"]:
+                    try:
+                        el = driver.find_element(By.XPATH, f"//input[@{attr}='{name}']")
+                        if el.is_displayed():
+                            fill_angular(el, value)
+                            filled = True
+                            break
+                    except: pass
+                if filled: break
+
+        # Verify all fields before clicking Next
+        verification = driver.execute_script("""
+            try {
+                var fields = ['qldCRN','firstName','lastName','address','suburb','postcode','email','phone'];
+                var result = {};
+                fields.forEach(function(name){
+                    var el = document.querySelector('[name="'+name+'"]');
+                    result[name] = el ? el.value : 'NOT_FOUND';
+                });
+                return result;
+            } catch(e){ return {error: e.toString()}; }
+        """)
+        log(f"  [BOOK] Customer fields verification: {verification}")
+
         log(f"  [BOOK] Clicking Next (after customer details)...")
         click_next(driver, wait)
         time.sleep(3)
@@ -472,85 +540,47 @@ def qld_book_slot(location, date_str, customer, vehicle):
         log(f"  [BOOK] After Next — Body: {page_state.get('body','?')[:150]}")
 
 
-        # Click paperwork checkbox — it's a checkbox input, not a button
-        # This triggers checkDuplicateBooking which makes the Update Booking popup appear
+        # Click the Paperwork button — id="Paperwork", ng-click="vm.checkDuplicateBooking(false)"
+        # This is a button (not a checkbox) that triggers the duplicate check
+        # which causes the "Update Booking" popup to appear
         paperwork_clicked = False
+        time.sleep(1)
 
-        # Strategy 1 — find checkbox by id/name/ng-click
-        try:
-            checkbox = driver.find_element(By.XPATH,
-                "//input[@type='checkbox' and ("
-                "@id='Paperwork' or @name='allPaperwork' or @name='paperwork' or "
-                "contains(@ng-click,'checkDuplicateBooking') or "
-                "contains(@ng-click,'Paperwork') or "
-                "contains(@ng-model,'paperwork') or "
-                "contains(@ng-model,'Paperwork'))]")
-            if not checkbox.is_selected():
-                driver.execute_script("arguments[0].click();", checkbox)
-            log(f"  [BOOK] Ticked paperwork checkbox (xpath strategy)")
+        result = driver.execute_script("""
+            try {
+                // Method 1 — click by button id
+                var btn = document.getElementById('Paperwork');
+                if(btn){ btn.click(); return 'clicked-by-id'; }
+
+                // Method 2 — call Angular scope method directly with false argument
+                var scope = angular.element(document.body).scope();
+                if(scope && scope.vm && typeof scope.vm.checkDuplicateBooking === 'function'){
+                    scope.vm.checkDuplicateBooking(false);
+                    scope.$apply();
+                    return 'scope:checkDuplicateBooking(false)';
+                }
+
+                // Method 3 — find by ng-click containing checkDuplicateBooking
+                var btns = document.querySelectorAll('button');
+                for(var i=0;i<btns.length;i++){
+                    var ngc = btns[i].getAttribute('ng-click') || btns[i].getAttribute('data-ng-click') || '';
+                    if(ngc.includes('checkDuplicateBooking')){
+                        btns[i].click();
+                        return 'clicked-by-ngclick:'+ngc;
+                    }
+                }
+
+                return 'not-found';
+            } catch(e){ return 'error:'+e.toString(); }
+        """)
+        log(f"  [BOOK] Paperwork click result: {result}")
+        if result and 'not-found' not in str(result) and 'error' not in str(result):
             paperwork_clicked = True
-            time.sleep(2)
-        except Exception:
-            pass
-
-        # Strategy 2 — find any unchecked checkbox on the page and tick it
-        if not paperwork_clicked:
-            result = driver.execute_script("""
-                try {
-                    // Log all checkboxes so we can see what's on the page
-                    var checks = document.querySelectorAll('input[type=checkbox]');
-                    var checkInfo = [];
-                    for(var i=0;i<checks.length;i++){
-                        var c = checks[i];
-                        var info = {
-                            id: c.id, name: c.name,
-                            ngclick: c.getAttribute('ng-click') || c.getAttribute('data-ng-click') || '',
-                            ngmodel: c.getAttribute('ng-model') || c.getAttribute('data-ng-model') || '',
-                            checked: c.checked, visible: c.offsetParent !== null
-                        };
-                        checkInfo.push(info);
-                        // Click if it looks like the paperwork checkbox
-                        var combined = (info.id + info.name + info.ngclick + info.ngmodel).toLowerCase();
-                        if(combined.includes('paperwork') || combined.includes('duplicate') || combined.includes('allpaper')){
-                            if(!c.checked) c.click();
-                            c.dispatchEvent(new Event('change', {bubbles:true}));
-                            return 'clicked-checkbox:' + JSON.stringify(info);
-                        }
-                    }
-
-                    // Strategy 3 — if only one checkbox on page, it's probably the paperwork one
-                    var visibleChecks = Array.from(checks).filter(function(c){ return c.offsetParent !== null; });
-                    if(visibleChecks.length === 1){
-                        if(!visibleChecks[0].checked) visibleChecks[0].click();
-                        visibleChecks[0].dispatchEvent(new Event('change', {bubbles:true}));
-                        return 'clicked-only-visible-checkbox';
-                    }
-
-                    // Strategy 4 — call Angular scope method directly
-                    try {
-                        var scope = angular.element(document.body).scope();
-                        if(scope && scope.vm){
-                            if(typeof scope.vm.checkDuplicateBooking === 'function'){
-                                scope.vm.checkDuplicateBooking(); scope.$apply();
-                                return 'scope:checkDuplicateBooking';
-                            }
-                            if(typeof scope.vm.allPaperwork === 'function'){
-                                scope.vm.allPaperwork(); scope.$apply();
-                                return 'scope:allPaperwork';
-                            }
-                        }
-                    } catch(e2){}
-
-                    return 'not-found|checkboxes:' + JSON.stringify(checkInfo);
-                } catch(e){ return 'error:' + e.toString(); }
-            """)
-            log(f"  [BOOK] Paperwork JS result: {str(result)[:300]}")
-            if result and 'not-found' not in str(result) and 'error' not in str(result):
-                paperwork_clicked = True
-            time.sleep(2)
+        time.sleep(2)
 
         if not paperwork_clicked:
-            log(f"  [BOOK] WARNING — could not tick paperwork checkbox", "WARN")
+            log(f"  [BOOK] WARNING — could not click paperwork button", "WARN")
+
 
 
         log(f"  [BOOK] Waiting for reCAPTCHA to render...")
