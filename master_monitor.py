@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-AVIBM Master Monitor — runs for ALL active customers in the database.
-Fetches customers from Supabase, checks each vehicle, auto-books if earlier slot found.
+AVIBM Master Monitor — Webhook server mode.
+Railway runs this as a persistent web server.
+A GET/POST to /run triggers the monitor.
+cron-job.org pings /run every 1 minute.
 """
 
 import csv, json, os, re, smtplib, sys, time, threading
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 from selenium import webdriver
@@ -20,7 +23,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SUPABASE_URL     = os.environ["SUPABASE_URL"]
-SUPABASE_KEY     = os.environ["SUPABASE_SERVICE_KEY"]   # service role key
+SUPABASE_KEY     = os.environ["SUPABASE_SERVICE_KEY"]
 TWOCAPTCHA_KEY   = os.environ["TWOCAPTCHA_API_KEY"]
 GMAIL_ADDR       = os.environ["GMAIL_ADDRESS"]
 GMAIL_PASS       = os.environ["GMAIL_APP_PASSWORD"]
@@ -32,13 +35,15 @@ SA_HOME_URL      = "https://www.ecom.transport.sa.gov.au/et/welcome.jsp"
 QLD_LOCATIONS    = ["Brisbane", "Bundaberg", "Burleigh Heads", "Cairns", "Mackay", "Narangba", "Rockhampton City", "Toowoomba", "Townsville", "Yatala"]
 QLD_CAPTCHA_KEY  = "6LfAG_0pAAAAAFQzCmk7OQ4roYKXfgYFAPwsVo-5"
 
-# Supabase requires both apikey and Authorization headers
-HEADERS          = {
+HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=representation",
 }
+
+# Prevent overlapping runs if a previous one is still going
+_run_lock = threading.Lock()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -118,22 +123,25 @@ def log_result(customer_id, vehicle_id, state, location, result, detail=""):
 
 def make_driver():
     opts = Options()
-    # Remove --headless so Angular behaves the same as local debug
-    # GitHub Actions uses Xvfb virtual display so this works fine
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,900")
     opts.add_argument("--log-level=3")
-    opts.add_argument("--display=:99")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     d = webdriver.Chrome(options=opts)
+    # Override navigator.webdriver so reCAPTCHA can't detect automation
+    d.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
     d.set_page_load_timeout(30)
     return d
 
 # ── 2captcha ──────────────────────────────────────────────────────────────────
 
 def solve_captcha(site_key, page_url, retries=3):
-    """Solve reCAPTCHA via 2captcha with retries on failure."""
     for attempt in range(retries):
         try:
             if attempt > 0:
@@ -143,32 +151,27 @@ def solve_captcha(site_key, page_url, retries=3):
                 "key": TWOCAPTCHA_KEY, "method": "userrecaptcha",
                 "googlekey": site_key, "pageurl": page_url, "json": 1,
             }, timeout=30)
-            if not r.text.strip():
-                log(f"  CAPTCHA submit returned empty response", "WARN")
-                continue
+            if not r.text.strip(): continue
             r_json = r.json()
             if r_json.get("status") != 1:
                 log(f"  CAPTCHA submit failed: {r_json.get('request')}", "WARN")
                 continue
             cid = r_json["request"]
             log(f"  CAPTCHA submitted (ID: {cid})")
-            for _ in range(30):  # up to 150 seconds
+            for _ in range(30):
                 time.sleep(5)
                 try:
                     resp = requests.get("http://2captcha.com/res.php", params={
                         "key": TWOCAPTCHA_KEY, "action": "get", "id": cid, "json": 1
                     }, timeout=10)
-                    if not resp.text.strip():
-                        continue  # empty response, keep waiting
+                    if not resp.text.strip(): continue
                     try:
                         p = resp.json()
                         if p.get("status") == 1:
                             log("  CAPTCHA solved!")
                             return p["request"]
                         req = p.get("request","")
-                        if req not in ("CAPCHA_NOT_READY", ""):
-                            log(f"  CAPTCHA error: {req}", "WARN")
-                            break
+                        if req not in ("CAPCHA_NOT_READY", ""): break
                     except:
                         t = resp.text.strip()
                         if t.startswith("OK|"): return t[3:]
@@ -208,12 +211,7 @@ def sel_by(driver, value, *xpaths):
     return False
 
 def click_next(driver, wait):
-    phrases = [
-        "submit my booking request",
-        "submit booking request",
-        "submit my booking",
-        "next",
-    ]
+    phrases = ["submit my booking request","submit booking request","submit my booking","next"]
     for phrase in phrases:
         try:
             btns = driver.find_elements(By.XPATH,
@@ -229,7 +227,6 @@ def click_next(driver, wait):
                     return True
         except Exception:
             continue
-    # Fallback to any submit button
     try:
         btn = driver.find_element(By.XPATH, "//button[@type='submit'] | //input[@type='submit']")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
@@ -255,14 +252,11 @@ def qld_find_slots(driver, cutoff, label, locations=None):
                 if location.lower() in opt.text.lower():
                     Select(sel).select_by_visible_text(opt.text); break
             else: continue
-
             try:
                 WebDriverWait(driver, 8).until(lambda d: len(
                     d.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']")) > 0)
             except TimeoutException:
                 log(f"  {label} / {location}: calendar timeout"); continue
-
-            # Wait for Angular to populate availability data
             time.sleep(3)
             cells = driver.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']")
             for item in cells:
@@ -286,19 +280,16 @@ def qld_find_slots(driver, cutoff, label, locations=None):
                     inMonth = data.get('inMonth')
                     cssAvail = data.get('cssAvail')
                     cssInMonth = data.get('cssInMonth')
-                    # Use Angular if available, fallback to CSS
                     use_av = av if av is not None else cssAvail
                     use_in = inMonth if inMonth is not None else cssInMonth
                     if use_av and use_in:
                         dt = parse_date(val)
                         if dt and dt < cutoff: slots.append((dt, val, location))
                 except: continue
-
             found = sum(1 for s in slots if s[2] == location)
             log(f"  {label} / {location}: {found} slot(s) before cutoff")
         except Exception as e:
             log(f"  {label} / {location}: error — {e}", "WARN")
-
     slots.sort(key=lambda x: x[0])
     return slots
 
@@ -309,8 +300,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
         log(f"  [BOOK] Loading WOVI page...")
         driver.get(QLD_BOOKING_URL)
         time.sleep(3)
-
-        # Select location
         log(f"  [BOOK] Selecting location: {location}")
         sel = wait.until(EC.presence_of_element_located((By.XPATH,
             "//select[.//option[contains(text(),'Brisbane')]]")))
@@ -318,8 +307,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
             if location.lower() in opt.text.lower():
                 Select(sel).select_by_visible_text(opt.text); break
         time.sleep(3)
-
-        # Wait for calendar
         log(f"  [BOOK] Waiting for calendar...")
         try:
             WebDriverWait(driver, 8).until(lambda d: len(
@@ -327,8 +314,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
         except TimeoutException:
             log(f"  [BOOK] Calendar did not load", "WARN")
             return (False, "")
-
-        # Click date
         log(f"  [BOOK] Clicking date: {date_str}")
         clicked = False
         for item in driver.find_elements(By.XPATH, "//div[@ng-click='setDateValue(day)']"):
@@ -341,17 +326,14 @@ def qld_book_slot(location, date_str, customer, vehicle):
         if not clicked:
             log(f"  [BOOK] Could not find date {date_str} on calendar", "WARN")
             return (False, "")
-
         log(f"  [BOOK] Selecting time slot...")
         selected_time = ""
         time.sleep(3)
         try:
-            # Try button-based time slots first (data-ng-repeat)
             time_btns = driver.find_elements(By.XPATH,
                 "//button[contains(@data-ng-repeat,'Slot in bookingSlots') or "
                 "contains(@data-ng-click,'selectedBookingSlotId')]")
             if not time_btns:
-                # Wait a bit more and retry
                 time.sleep(3)
                 time_btns = driver.find_elements(By.XPATH,
                     "//button[contains(@data-ng-repeat,'Slot in bookingSlots') or "
@@ -367,7 +349,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 selected_time = earliest_btn.text.strip()
                 log(f"  [BOOK] Selected time: {selected_time}")
             else:
-                # Fallback: try via Angular scope
                 result = driver.execute_script("""
                     try {
                         var btns = document.querySelectorAll('button');
@@ -378,10 +359,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
                                 timeSlots.push(btns[i]);
                             }
                         }
-                        if (timeSlots.length > 0) {
-                            timeSlots[0].click();
-                            return timeSlots[0].textContent.trim();
-                        }
+                        if (timeSlots.length > 0) { timeSlots[0].click(); return timeSlots[0].textContent.trim(); }
                         return null;
                     } catch(e) { return null; }
                 """)
@@ -392,24 +370,18 @@ def qld_book_slot(location, date_str, customer, vehicle):
                     log(f"  [BOOK] No time slots found — proceeding without time selection", "WARN")
         except Exception as e:
             log(f"  [BOOK] Time slot error: {e}", "WARN")
-
         time.sleep(1)
         log(f"  [BOOK] Clicking Next (after time)...")
         click_next(driver, wait)
         time.sleep(3)
-
-        # Vehicle details
         log(f"  [BOOK] Filling vehicle details...")
         vtype = vehicle.get("vehicle_type","Car")
         try:
-            driver.find_element(By.XPATH, f"//label[contains(normalize-space(.,'{vtype}')]")
             driver.execute_script("arguments[0].click();", driver.find_element(By.XPATH, f"//label[contains(normalize-space(.),'{vtype}')]"))
         except: pass
-
         fill(driver, vehicle["vin"],            "vin","chassis","VIN","vinChassis")
         fill(driver, vehicle["make"],           "make","vehicleMake")
         fill(driver, vehicle["model"],          "model","vehicleModel")
-        # Year is a dropdown
         if not sel_by(driver, vehicle["year"],
             "//select[contains(@name,'year') or contains(@ng-model,'year') or "
             "contains(@name,'buildYear') or contains(@ng-model,'buildYear') or "
@@ -423,19 +395,14 @@ def qld_book_slot(location, date_str, customer, vehicle):
                "//select[contains(@ng-model,'damage') or contains(@name,'damage')]")
         sel_by(driver, vehicle["purchase_method"],
                "//select[contains(@ng-model,'purchase') or contains(@name,'purchase')]")
-
         log(f"  [BOOK] Clicking Next (after vehicle details)...")
         click_next(driver, wait)
         time.sleep(2)
-
-        # Customer details
         log(f"  [BOOK] Filling customer details...")
-        # CRN — use nativeInputValueSetter to bypass Angular validation
         try:
             crn_el = driver.find_element(By.XPATH, "//input[@name='qldCRN']")
             driver.execute_script("""
-                var el = arguments[0];
-                var val = arguments[1];
+                var el = arguments[0]; var val = arguments[1];
                 el.focus();
                 var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                 setter.call(el, val);
@@ -445,13 +412,11 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 try {
                     var scope = angular.element(el).scope();
                     if (scope && scope.vm && scope.vm.forms && scope.vm.forms.customerDetails) {
-                        scope.vm.forms.customerDetails.qldCRN = val;
-                        scope.$apply();
+                        scope.vm.forms.customerDetails.qldCRN = val; scope.$apply();
                     }
                 } catch(e) {}
             """, crn_el, str(customer["crn"]))
             time.sleep(0.5)
-            log(f"  [BOOK] CRN filled: {crn_el.get_attribute('value')}")
         except Exception as e:
             log(f"  [BOOK] CRN error: {e}", "WARN")
             fill(driver, customer["crn"], "qldCRN","crn","CRN","licenceNumber","crnLicence")
@@ -462,12 +427,9 @@ def qld_book_slot(location, date_str, customer, vehicle):
         fill(driver, customer["postcode"],   "postcode","zipCode")
         fill(driver, customer["email"],      "email","emailAddress")
         fill(driver, customer["phone"],      "phone","mobile","mobileNumber")
-
         log(f"  [BOOK] Clicking Next (after customer details)...")
         click_next(driver, wait)
         time.sleep(2)
-
-        # Click paperwork button (id="Paperwork", triggers checkDuplicateBooking)
         try:
             paperwork_btn = driver.find_element(By.XPATH,
                 "//button[@id='Paperwork' or @name='allPaperwork' or "
@@ -477,8 +439,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
             time.sleep(2)
         except Exception as e:
             log(f"  [BOOK] Paperwork button not found: {e}", "WARN")
-
-        # Wait for reCAPTCHA widget to fully render before solving
         log(f"  [BOOK] Waiting for reCAPTCHA to render...")
         for _ in range(10):
             has_captcha = driver.execute_script(
@@ -486,26 +446,22 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 "document.querySelector('iframe[src*=recaptcha]') !== null"
             )
             if has_captcha:
-                log(f"  [BOOK] reCAPTCHA widget detected")
-                break
+                log(f"  [BOOK] reCAPTCHA widget detected"); break
             time.sleep(1)
         else:
             log(f"  [BOOK] reCAPTCHA widget not found — proceeding anyway", "WARN")
-
-        # CAPTCHA
         log(f"  [BOOK] Solving CAPTCHA...")
         token = solve_captcha(QLD_CAPTCHA_KEY, QLD_BOOKING_URL)
-        if not token: return False
-
+        if not token: return (False, "")
+        # Wait for iframe to fully load before injecting
+        time.sleep(3)
         driver.execute_script("""
             var token = arguments[0];
-            // Set token in all response fields
             var el1 = document.getElementById('g-recaptcha-response');
             if (el1) { el1.innerHTML = token; el1.value = token; el1.style.display = 'block'; }
             document.querySelectorAll('[name="g-recaptcha-response"]').forEach(function(el) {
                 el.innerHTML = token; el.value = token;
             });
-            // Fire grecaptcha callbacks
             try {
                 var cfg = window.___grecaptcha_cfg;
                 if (cfg && cfg.clients) {
@@ -516,7 +472,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
                             if (obj && typeof obj.callback === 'function') {
                                 try { obj.callback(token); } catch(e) {}
                             }
-                            // Also try l, m, n etc (grecaptcha internal keys)
                             if (obj && obj.l && typeof obj.l === 'function') {
                                 try { obj.l(token); } catch(e) {}
                             }
@@ -524,18 +479,15 @@ def qld_book_slot(location, date_str, customer, vehicle):
                     });
                 }
             } catch(e) {}
-            // Trigger Angular digest
-            try {
-                angular.element(document.body).scope().$apply();
-            } catch(e) {}
+            try { angular.element(document.body).scope().$apply(); } catch(e) {}
         """, token)
-        # Re-inject token right before clicking submit (in case it expired during long solve)
+        time.sleep(1)
+        # Re-inject right before submit
         driver.execute_script("""
             var token=arguments[0];
             var el1=document.getElementById('g-recaptcha-response');
             if(el1){el1.innerHTML=token;el1.value=token;}
-            var els=document.querySelectorAll('[name="g-recaptcha-response"]');
-            els.forEach(function(el){el.innerHTML=token;el.value=token;});
+            document.querySelectorAll('[name="g-recaptcha-response"]').forEach(function(el){el.innerHTML=token;el.value=token;});
             try {
                 var cfg=window.___grecaptcha_cfg;
                 if(cfg&&cfg.clients){
@@ -552,14 +504,10 @@ def qld_book_slot(location, date_str, customer, vehicle):
             try{angular.element(document.body).scope().$apply();}catch(e){}
         """, token)
         time.sleep(1)
-        log(f"  [BOOK] CAPTCHA token re-injected — submitting...")
-        log(f"  [BOOK] Clicking Submit My Booking Request...")
+        log(f"  [BOOK] Submitting booking...")
         click_next(driver, wait)
         time.sleep(4)
-
         log(f"  [BOOK] Page after submit: {driver.title}")
-
-        # Handle "Would you like to update your booking?" popup
         clicked_popup = False
         log(f"  Waiting for Update Booking popup (up to 20s)...")
         try:
@@ -570,7 +518,6 @@ def qld_book_slot(location, date_str, customer, vehicle):
             )
             log("  Popup detected — triggering Update Booking via Angular")
             time.sleep(2)
-
             result = driver.execute_script("""
                 try {
                     var btn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
@@ -583,35 +530,19 @@ def qld_book_slot(location, date_str, customer, vehicle):
                 log("  ✓ Update Booking triggered via Angular")
                 clicked_popup = True
                 time.sleep(5)
-            else:
-                log(f"  triggerHandler failed: {result}", "WARN")
-
         except TimeoutException:
-            log(f"  Popup not found after 20s — page title: {driver.title}", "WARN")
-            log(f"  Page URL: {driver.current_url}", "WARN")
-            # Log snippet to understand what page we're on
-            log(f"  Page source start: {driver.page_source[:200]}", "WARN")
-
-        # Wait for confirmation page
+            log(f"  Popup not found after 20s", "WARN")
         time.sleep(3)
-        page_source = driver.page_source
-        page_lower  = page_source.lower()
-        log(f"  Page after final step: {driver.title}")
-        log(f"  URL: {driver.current_url}")
-
-        # Only confirm if Update Booking was actually clicked
+        page_lower = driver.page_source.lower()
         confirmed = clicked_popup and any(w in page_lower for w in [
             "booking has been secured", "your booking reference",
             "inspection has been booked", "confirmed", "success", "thank you"
         ])
-
         if confirmed:
             log(f"  ✅ Booking confirmed!")
         else:
-            log(f"  ❌ Booking NOT confirmed — Update Booking popup not clicked or confirmation not found", "WARN")
-
+            log(f"  ❌ Booking NOT confirmed", "WARN")
         return (confirmed, selected_time)
-
     except Exception as e:
         log(f"QLD booking error: {e}", "ERROR"); return (False, "")
     finally:
@@ -624,23 +555,17 @@ def sa_check(customer, vehicle, cutoff):
         sess = requests.Session()
         sess.get(SA_HOME_URL, timeout=15)
         sess.get(SA_BOOKING_URL, timeout=15)
-
         dob = "".join(c for c in customer.get("date_of_birth","") if c.isdigit())
         preferred = (datetime.now() + timedelta(days=90)).strftime("%d%m%Y")
-
         r = sess.post(SA_BOOKING_URL, data={
-            "clientNumber":       customer["licence_number"],
+            "clientNumber": customer["licence_number"],
             "clientSurnameOrgName": customer["last_name"],
-            "clientDOB":          dob,
+            "clientDOB": dob,
         }, timeout=15)
-
         r2 = sess.post(SA_BOOKING_URL, data={"preferredDate": preferred}, timeout=15)
-
-        # Parse available slots
         import re as _re
         slots_raw = _re.findall(r'<option[^>]*value="[^"]*"[^>]*>(From[^<]+)</option>', r2.text)
         slots_raw += _re.findall(r'From\s+\w+\s+\d{1,2}/\d{2}/\d{4}\s+\d{2}:\d{2}', r2.text)
-
         available = []
         for raw in slots_raw:
             clean = raw.replace('\xa0',' ').strip()
@@ -649,305 +574,244 @@ def sa_check(customer, vehicle, cutoff):
                 dt = parse_date(m.group(1))
                 if dt and dt < cutoff:
                     available.append((dt, clean))
-
         available.sort(key=lambda x: x[0])
         return available
-
     except Exception as e:
         log(f"SA check error: {e}", "ERROR")
         return []
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main run logic ────────────────────────────────────────────────────────────
 
 def run():
-    log("=" * 60)
-    log("AVIBM Master Monitor — checking all active customers")
-    log("=" * 60)
+    # Prevent two runs overlapping
+    if not _run_lock.acquire(blocking=False):
+        log("Previous run still in progress — skipping this trigger")
+        return "skipped"
 
-    # Fetch all active customers with their vehicles
-    log(f"Connecting to Supabase: {SUPABASE_URL}")
-    log(f"Key prefix: {SUPABASE_KEY[:20]}...")
-    customers = db_get("customers", "active=eq.true&select=*,vehicles(*)")
-    if isinstance(customers, dict) and customers.get("error"):
-        log(f"Failed to fetch customers: {customers}", "ERROR")
-        sys.exit(1)
-    if not isinstance(customers, list):
-        log(f"Unexpected response from Supabase: {customers}", "ERROR")
-        sys.exit(1)
+    try:
+        log("=" * 60)
+        log("AVIBM Master Monitor — checking all active customers")
+        log("=" * 60)
 
-    active_customers = [c for c in customers if isinstance(c, dict) and c.get("active")]
-    log(f"Found {len(active_customers)} active customer(s)")
+        customers = db_get("customers", "active=eq.true&select=*,vehicles(*)")
+        if isinstance(customers, dict) and customers.get("error"):
+            log(f"Failed to fetch customers: {customers}", "ERROR")
+            return "error"
+        if not isinstance(customers, list):
+            log(f"Unexpected Supabase response: {customers}", "ERROR")
+            return "error"
 
-    # Note: booking_in_progress flags are cleared by the booking attempt itself (success or failure)
+        active_customers = [c for c in customers if isinstance(c, dict) and c.get("active")]
+        log(f"Found {len(active_customers)} active customer(s)")
 
-    if not active_customers:
-        log("No active customers — nothing to do.")
-        return
+        if not active_customers:
+            log("No active customers — nothing to do.")
+            return "ok"
 
-    # Group QLD customers by whether they need Chrome
-    qld_customers = [c for c in active_customers if c.get("state") == "QLD"]
-    sa_customers  = [c for c in active_customers if c.get("state") == "SA"]
+        qld_customers = [c for c in active_customers if c.get("state") == "QLD"]
+        sa_customers  = [c for c in active_customers if c.get("state") == "SA"]
 
-    # ── QLD: single browser session for all checking ──────────────────────────
-    if qld_customers:
-        # Sort customers by tier priority: priority first, then standard, then basic
         TIER_ORDER = {"priority": 0, "standard": 1, "basic": 2}
         TIER_DELAY = {"priority": 0, "standard": 30, "basic": 60}
         TIER_LABEL = {"priority": "🥇 PRIORITY", "standard": "🥈 STANDARD", "basic": "🥉 BASIC"}
 
-        qld_customers.sort(key=lambda c: TIER_ORDER.get(c.get("tier","standard"), 1))
-
-        log(f"Checking {len(qld_customers)} QLD customer(s) (sorted by tier)...")
-        driver = make_driver()
-        booking_jobs = []
-
-        try:
-            driver.get(QLD_BOOKING_URL)
-            time.sleep(3)
-
-            for customer in qld_customers:
-                tier = customer.get("tier", "standard")
-                vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
-                for vehicle in vehicles:
-                    raw_cutoff = vehicle.get("cutoff_date","")
-                    cutoff = parse_date(raw_cutoff)
-                    if not cutoff:
-                        log(f"  Skipping {customer['first_name']} — invalid cutoff: {raw_cutoff}", "WARN")
-                        continue
-
-                    # Auto-deactivate vehicle if cutoff date was more than 24 hours ago
-                    now_naive = datetime.now()
-                    if (now_naive - cutoff).total_seconds() > 86400:
-                        log(f"  Auto-deactivating vehicle — cutoff {cutoff.strftime('%d/%m/%Y')} has passed by more than 24 hours")
-                        db_patch("vehicles", "id", vehicle["id"], {"active": False})
-                        continue
-
-                    label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
-                    log(f"Checking [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
-
-                    vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
-                    slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
-                    log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
-
-                    # Skip if booking already in progress started less than 10 minutes ago
-                    if vehicle.get("booking_in_progress"):
-                        started_at = vehicle.get("booking_started_at")
-                        if started_at:
-                            try:
-                                from datetime import timezone as tz
-                                started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                                age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
-                                if age_mins < 5:
-                                    log(f"  Skipping {label} — booking in progress ({age_mins:.1f} min ago)")
-                                    continue
-                                else:
-                                    log(f"  Resetting stale flag for {label} ({age_mins:.1f} min old — threshold 5 min)")
-                                    db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
-                            except Exception:
-                                log(f"  Skipping {label} — booking in progress (unknown age)")
-                                continue
-                        else:
-                            log(f"  Skipping {label} — booking already in progress")
+        if qld_customers:
+            qld_customers.sort(key=lambda c: TIER_ORDER.get(c.get("tier","standard"), 1))
+            log(f"Checking {len(qld_customers)} QLD customer(s)...")
+            driver = make_driver()
+            booking_jobs = []
+            try:
+                driver.get(QLD_BOOKING_URL)
+                time.sleep(3)
+                for customer in qld_customers:
+                    tier = customer.get("tier", "standard")
+                    vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
+                    for vehicle in vehicles:
+                        raw_cutoff = vehicle.get("cutoff_date","")
+                        cutoff = parse_date(raw_cutoff)
+                        if not cutoff:
+                            log(f"  Skipping {customer['first_name']} — invalid cutoff: {raw_cutoff}", "WARN")
                             continue
-
-                    if slots:
-                        priority_locs = vehicle.get("priority_locations") or []
-                        chosen = None
-
-                        if priority_locs:
-                            # Find earliest date across ALL locations
-                            earliest_dt = slots[0][0]
-                            # Check if any priority location has a slot on that earliest date
-                            priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
-                            if priority_slots:
-                                chosen = priority_slots[0]
-                                log(f"  → Priority slot: {chosen[1]} at {chosen[2]}")
+                        now_naive = datetime.now()
+                        if (now_naive - cutoff).total_seconds() > 86400:
+                            log(f"  Auto-deactivating vehicle — cutoff passed by 24h")
+                            db_patch("vehicles", "id", vehicle["id"], {"active": False})
+                            continue
+                        label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
+                        log(f"Checking [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
+                        vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
+                        slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
+                        log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
+                        if vehicle.get("booking_in_progress"):
+                            started_at = vehicle.get("booking_started_at")
+                            if started_at:
+                                try:
+                                    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                                    age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+                                    if age_mins < 5:
+                                        log(f"  Skipping — booking in progress ({age_mins:.1f} min ago)")
+                                        continue
+                                    else:
+                                        db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
+                                except Exception:
+                                    continue
                             else:
-                                # Priority locations don't have earliest date — book earliest anywhere
+                                continue
+                        if slots:
+                            priority_locs = vehicle.get("priority_locations") or []
+                            if priority_locs:
+                                earliest_dt = slots[0][0]
+                                priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
+                                chosen = priority_slots[0] if priority_slots else slots[0]
+                            else:
                                 chosen = slots[0]
-                                log(f"  → No priority slot available — using earliest: {chosen[1]} at {chosen[2]}")
-                        else:
-                            # No priority set — just book earliest slot
-                            chosen = slots[0]
+                            dt, ds, loc = chosen
+                            log(f"  → Earlier slot: {ds} at {loc}")
+                            booking_jobs.append((customer, vehicle, dt, ds, loc, tier))
+            finally:
+                try: driver.quit()
+                except: pass
 
-                        dt, ds, loc = chosen
-                        log(f"  → Earlier slot: {ds} at {loc}")
-                        booking_jobs.append((customer, vehicle, dt, ds, loc, tier))
-
-        finally:
-            try: driver.quit()
-            except: pass
-
-        def book_vehicle(customer, vehicle, dt, ds, loc, tier, delay=0):
-            """Book a single vehicle — runs in its own thread for parallel booking."""
-            if delay > 0:
-                log(f"[{TIER_LABEL[tier]}] Waiting {delay}s before booking (tier delay)...")
-                time.sleep(delay)
-
-            log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
-
-            # Atomic claim — only one workflow can claim this vehicle at a time
-            claim_resp = requests.patch(
-                f"{SUPABASE_URL}/rest/v1/vehicles?id=eq.{vehicle['id']}&booking_in_progress=eq.false",
-                headers={**HEADERS, "Prefer": "return=representation"},
-                json={
-                    "booking_in_progress": True,
-                    "booking_started_at": datetime.now(timezone.utc).isoformat()
-                }
-            )
-            claimed = claim_resp.json()
-            if not claimed or len(claimed) == 0:
-                log(f"  Could not claim vehicle — another workflow already booking it, skipping")
-                return
-            log(f"  ✓ Claimed vehicle for booking")
-            result = qld_book_slot(loc, ds, customer, vehicle)
-            confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
-            if confirmed:
-                old_cutoff = vehicle.get("cutoff_date", "")
-                booking_slot = f"{ds} at {booked_time}" if booked_time else ds
-                db_patch("vehicles", "id", vehicle["id"], {
-                    "booked_date": ds,
-                    "booked_time": booked_time,
-                    "booked_location": loc,
-                    "previous_cutoff": old_cutoff,
-                    "cutoff_date": ds,
-                    "booking_in_progress": False,
-                })
-                log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
-                booking_html = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"/></head>
+            def book_vehicle(customer, vehicle, dt, ds, loc, tier, delay=0):
+                if delay > 0:
+                    log(f"[{TIER_LABEL[tier]}] Waiting {delay}s before booking...")
+                    time.sleep(delay)
+                log(f"[{TIER_LABEL[tier]}] Booking {loc} on {ds} for {customer['first_name']} {customer['last_name']}...")
+                claim_resp = requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/vehicles?id=eq.{vehicle['id']}&booking_in_progress=eq.false",
+                    headers={**HEADERS, "Prefer": "return=representation"},
+                    json={"booking_in_progress": True, "booking_started_at": datetime.now(timezone.utc).isoformat()}
+                )
+                claimed = claim_resp.json()
+                if not claimed or len(claimed) == 0:
+                    log(f"  Could not claim vehicle — skipping")
+                    return
+                result = qld_book_slot(loc, ds, customer, vehicle)
+                confirmed, booked_time = result if isinstance(result, tuple) else (result, "")
+                if confirmed:
+                    old_cutoff = vehicle.get("cutoff_date", "")
+                    db_patch("vehicles", "id", vehicle["id"], {
+                        "booked_date": ds, "booked_time": booked_time,
+                        "booked_location": loc, "previous_cutoff": old_cutoff,
+                        "cutoff_date": ds, "booking_in_progress": False,
+                    })
+                    log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKED", ds)
+                    booking_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>
 <body style="margin:0;padding:0;background:#0a0a0a;font-family:Helvetica,Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:40px 20px;">
-<tr><td align="center">
-<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td align="center"><table width="600" cellpadding="0" cellspacing="0">
 <tr><td style="background:#111;border:1px solid #2a2a2a;border-radius:12px 12px 0 0;padding:32px 40px;text-align:center;">
-  <div style="font-size:32px;font-weight:900;letter-spacing:0.2em;color:#C9A84C;font-family:Arial Black,Arial,sans-serif;">AVIBM</div>
+  <div style="font-size:32px;font-weight:900;letter-spacing:0.2em;color:#C9A84C;">AVIBM</div>
   <div style="font-size:11px;letter-spacing:0.25em;color:#666;margin-top:4px;text-transform:uppercase;">Australian Vehicle Inspection Booking Monitor</div>
-  <div style="width:60px;height:2px;background:#C9A84C;margin:16px auto 0;"></div>
 </td></tr>
 <tr><td style="background:#141414;border-left:1px solid #2a2a2a;border-right:1px solid #2a2a2a;padding:40px;">
-  <div style="text-align:center;margin-bottom:28px;">
-    <h1 style="margin:0 0 8px;font-size:28px;font-weight:900;color:#ffffff;">BOOKING CONFIRMED</h1>
-    <p style="margin:0;font-size:15px;color:#C9A84C;">We found you an earlier slot!</p>
-  </div>
-  <p style="margin:0 0 24px;font-size:15px;color:#aaa;line-height:1.7;">Great news! We found an earlier inspection slot and have automatically rebooked your vehicle. Here are your new booking details:</p>
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:24px;">
-  <tr><td style="padding:24px;">
-    <div style="font-size:11px;letter-spacing:0.15em;color:#5adb5a;text-transform:uppercase;margin-bottom:16px;">New Booking Details</div>
-    <table width="100%" cellpadding="0" cellspacing="0">
-      <tr><td style="padding:6px 0;font-size:13px;color:#4a7a4a;width:120px;">Location</td><td style="padding:6px 0;font-size:15px;color:#fff;font-weight:700;">{loc}</td></tr>
-      <tr><td style="padding:6px 0;font-size:13px;color:#4a7a4a;">Date</td><td style="padding:6px 0;font-size:15px;color:#5adb5a;font-weight:700;">{ds}</td></tr>
-    </table>
-  </td></tr></table>
-  <div style="padding:16px 20px;background:#1a1a0a;border:1px solid #3a3a00;border-radius:8px;margin-bottom:24px;">
-    <p style="margin:0;font-size:13px;color:#C9A84C;line-height:1.6;">Please verify your booking at <a href="https://wovi.com.au" style="color:#C9A84C;">wovi.com.au</a> and contact Queensland Inspection Services on 1300 722 411 if you have any questions.</p>
-  </div>
-  <p style="margin:0;font-size:13px;color:#555;line-height:1.7;">Thank you for using AVIBM. Our system will continue monitoring in case an even earlier slot becomes available.</p>
+  <h1 style="margin:0 0 8px;font-size:28px;color:#fff;">BOOKING CONFIRMED</h1>
+  <p style="color:#C9A84C;">We found you an earlier slot!</p>
+  <p style="color:#aaa;">Location: <strong style="color:#fff;">{loc}</strong></p>
+  <p style="color:#aaa;">Date: <strong style="color:#5adb5a;">{ds}</strong></p>
+  <p style="color:#aaa;">Please verify at <a href="https://wovi.com.au" style="color:#C9A84C;">wovi.com.au</a></p>
 </td></tr>
-<tr><td style="background:#0f0f0f;border:1px solid #2a2a2a;border-top:1px solid #1e1e1e;border-radius:0 0 12px 12px;padding:24px 40px;text-align:center;">
-  <div style="font-size:12px;color:#444;line-height:1.8;">AVIBM — Australian Vehicle Inspection Booking Monitor<br/>
-  <a href="https://avibm.vercel.app" style="color:#C9A84C;text-decoration:none;">avibm.vercel.app</a></div>
-</td></tr>
-</table></td></tr></table>
-</body></html>"""
-                send_email(
-                    f"AVIBM — Booking Confirmed: {loc} on {ds}" + (f" at {booked_time}" if booked_time else ""),
-                    f"Great news! We found an earlier slot and rebooked your vehicle.\n\nLocation: {loc}\nDate: {ds}" + (f"\nTime: {booked_time}" if booked_time else "") + f"\n\nPlease verify at wovi.com.au\n— AVIBM",
-                    customer["email"],
-                    html=booking_html,
-                )
-            else:
-                log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKING FAILED", ds)
-                log(f"  Booking failed for {customer['first_name']} {customer['last_name']}", "WARN")
-                db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False})
-
-        # Launch all booking jobs in parallel threads (one per vehicle)
-        # Priority customers get no delay, lower tiers get their delay applied inside the thread
-        threads = []
-        seen_tiers = {}
-        for job in booking_jobs:
-            customer, vehicle, dt, ds, loc, tier = job
-            # Calculate cumulative delay for this tier
-            delay = 0
-            if tier != 'priority':
-                delay = TIER_DELAY.get(tier, 0)
-            t = threading.Thread(
-                target=book_vehicle,
-                args=(customer, vehicle, dt, ds, loc, tier, delay),
-                daemon=True
-            )
-            threads.append(t)
-
-        # Start all threads simultaneously
-        for t in threads:
-            t.start()
-
-        # Wait for all bookings to complete before continuing
-        for t in threads:
-            t.join()
-
-        log(f"All booking threads completed")
-
-    # ── SA: requests-based, no browser needed ────────────────────────────────
-    if sa_customers:
-        log(f"Checking {len(sa_customers)} SA customer(s)...")
-        for customer in sa_customers:
-            vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
-            for vehicle in vehicles:
-                cutoff = parse_date(vehicle.get("cutoff_date",""))
-                if not cutoff: continue
-
-                label = f"{customer['first_name']} {customer['last_name']}"
-                log(f"Checking [🥇 PRIORITY] SA / {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
-
-                slots = sa_check(customer, vehicle, cutoff)
-                log_result(customer["id"], vehicle["id"], "SA", "Regency Park", "Checked", f"{len(slots)} slots found")
-
-                if slots:
-                    dt, slot_text = slots[0]
-                    log(f"  → Earlier SA slot: {slot_text}")
-                    # SA auto-booking would go here (currently sends alert email)
+<tr><td style="background:#0f0f0f;border:1px solid #2a2a2a;border-radius:0 0 12px 12px;padding:24px 40px;text-align:center;">
+  <div style="font-size:12px;color:#444;">AVIBM — <a href="https://avibm.vercel.app" style="color:#C9A84C;">avibm.vercel.app</a></div>
+</td></tr></table></td></tr></table></body></html>"""
                     send_email(
-                        f"SA Inspection — Earlier Slot Available: {slot_text}",
-                        f"An earlier inspection slot is available for {label}.\n\n"
-                        f"Slot: {slot_text}\n\n"
-                        f"Book now at:\nhttps://www.ecom.transport.sa.gov.au/et/rescheduleAVehicleInspectionBooking.do\n\n"
-                        f"— AVIBM Automated Booking Monitor",
-                        customer["email"]
+                        f"AVIBM — Booking Confirmed: {loc} on {ds}" + (f" at {booked_time}" if booked_time else ""),
+                        f"Great news! We found an earlier slot and rebooked your vehicle.\n\nLocation: {loc}\nDate: {ds}" + (f"\nTime: {booked_time}" if booked_time else "") + f"\n\nPlease verify at wovi.com.au\n— AVIBM",
+                        customer["email"], html=booking_html,
                     )
-                    log_result(customer["id"], vehicle["id"], "SA", "Regency Park", "SLOT FOUND", slot_text)
                 else:
-                    log(f"  {label}: no earlier SA slots.")
+                    log_result(customer["id"], vehicle["id"], "QLD", loc, "BOOKING FAILED", ds)
+                    db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False})
 
-    log("All done.")
+            threads = []
+            for job in booking_jobs:
+                customer, vehicle, dt, ds, loc, tier = job
+                delay = TIER_DELAY.get(tier, 0) if tier != 'priority' else 0
+                t = threading.Thread(target=book_vehicle, args=(customer, vehicle, dt, ds, loc, tier, delay), daemon=True)
+                threads.append(t)
+            for t in threads: t.start()
+            for t in threads: t.join()
+            log("All booking threads completed")
 
-    # Update monitor status in Supabase
-    try:
-        from zoneinfo import ZoneInfo
-        adelaide = ZoneInfo("Australia/Adelaide")
-        now_str = datetime.now(adelaide).strftime("%d/%m/%Y %I:%M:%S %p ACST")
-        status_data = {
-            "id": "main",
-            "last_run": now_str,
-            "active_customers": len(active_customers),
-            "qld_count": len(qld_customers),
-            "sa_count": len(sa_customers),
-            "status": "running",
-        }
-        # Delete existing row first then insert fresh
-        requests.delete(
-            f"{SUPABASE_URL}/rest/v1/monitor_status?id=eq.main",
-            headers=HEADERS,
-        )
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/monitor_status",
-            json=status_data,
-            headers=HEADERS,
-        )
-        log(f"Monitor status update: {r.status_code} {r.text[:100]}")
-    except Exception as e:
-        log(f"Could not update monitor status: {e}", "WARN")
+        if sa_customers:
+            log(f"Checking {len(sa_customers)} SA customer(s)...")
+            for customer in sa_customers:
+                vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
+                for vehicle in vehicles:
+                    cutoff = parse_date(vehicle.get("cutoff_date",""))
+                    if not cutoff: continue
+                    label = f"{customer['first_name']} {customer['last_name']}"
+                    log(f"Checking SA / {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
+                    slots = sa_check(customer, vehicle, cutoff)
+                    log_result(customer["id"], vehicle["id"], "SA", "Regency Park", "Checked", f"{len(slots)} slots found")
+                    if slots:
+                        dt, slot_text = slots[0]
+                        log(f"  → Earlier SA slot: {slot_text}")
+                        send_email(
+                            f"SA Inspection — Earlier Slot Available: {slot_text}",
+                            f"An earlier inspection slot is available for {label}.\n\nSlot: {slot_text}\n\nBook now at:\nhttps://www.ecom.transport.sa.gov.au/et/rescheduleAVehicleInspectionBooking.do\n\n— AVIBM",
+                            customer["email"]
+                        )
+                        log_result(customer["id"], vehicle["id"], "SA", "Regency Park", "SLOT FOUND", slot_text)
+                    else:
+                        log(f"  {label}: no earlier SA slots.")
+
+        log("All done.")
+
+        try:
+            from zoneinfo import ZoneInfo
+            adelaide = ZoneInfo("Australia/Adelaide")
+            status_data = {
+                "id": "main",
+                "last_run": datetime.now(adelaide).strftime("%d/%m/%Y %I:%M:%S %p ACST"),
+                "active_customers": len(active_customers),
+                "qld_count": len(qld_customers),
+                "sa_count": len(sa_customers),
+                "status": "running",
+            }
+            requests.delete(f"{SUPABASE_URL}/rest/v1/monitor_status?id=eq.main", headers=HEADERS)
+            requests.post(f"{SUPABASE_URL}/rest/v1/monitor_status", json=status_data, headers=HEADERS)
+        except Exception as e:
+            log(f"Could not update monitor status: {e}", "WARN")
+
+        return "ok"
+
+    finally:
+        _run_lock.release()
+
+# ── Webhook server ────────────────────────────────────────────────────────────
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress default HTTP logs — our own log() handles output
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, "AVIBM is alive")
+        elif self.path == "/run":
+            self._respond(200, "Trigger received — running monitor in background")
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            self._respond(404, "Not found")
+
+    def do_POST(self):
+        if self.path == "/run":
+            self._respond(200, "Trigger received — running monitor in background")
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            self._respond(404, "Not found")
+
+    def _respond(self, code, message):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(message.encode())
 
 
 if __name__ == "__main__":
-    run()
+    port = int(os.environ.get("PORT", 8080))
+    log(f"AVIBM webhook server starting on port {port}")
+    log(f"Trigger URL: http://0.0.0.0:{port}/run")
+    log(f"Health check: http://0.0.0.0:{port}/health")
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    server.serve_forever()
