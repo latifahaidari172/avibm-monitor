@@ -20,6 +20,11 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+try:
+    import undetected_chromedriver as uc
+    UC_AVAILABLE = True
+except ImportError:
+    UC_AVAILABLE = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -122,23 +127,40 @@ def log_result(customer_id, vehicle_id, state, location, result, detail=""):
 
 # ── Chrome ────────────────────────────────────────────────────────────────────
 
-def make_driver():
-    opts = Options()
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument("--log-level=3")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    d = webdriver.Chrome(options=opts)
-    # Override navigator.webdriver so reCAPTCHA can't detect automation
-    d.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    })
-    d.set_page_load_timeout(30)
-    return d
+def make_driver(use_uc=True):
+    """
+    use_uc=True  → undetected_chromedriver (booking step, bypasses reCAPTCHA detection)
+    use_uc=False → plain selenium Chrome (scanning step, faster)
+    """
+    if use_uc and UC_AVAILABLE:
+        opts = uc.ChromeOptions()
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,900")
+        opts.add_argument("--display=:99")
+        d = uc.Chrome(options=opts, headless=False)
+        d.set_page_load_timeout(30)
+        log("Driver: undetected_chromedriver (anti-bot mode)")
+        return d
+    else:
+        # Fallback to plain selenium for scanning
+        opts = Options()
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,900")
+        opts.add_argument("--log-level=3")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        d = webdriver.Chrome(options=opts)
+        d.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+        d.set_page_load_timeout(30)
+        log("Driver: plain selenium (scan mode)")
+        return d
 
 # ── 2captcha ──────────────────────────────────────────────────────────────────
 
@@ -295,7 +317,7 @@ def qld_find_slots(driver, cutoff, label, locations=None):
     return slots
 
 def qld_book_slot(location, date_str, customer, vehicle):
-    driver = make_driver()
+    driver = make_driver(use_uc=True)  # Always use undetected driver for booking
     wait   = WebDriverWait(driver, 20)
     try:
         log(f"  [BOOK] Loading WOVI page...")
@@ -760,7 +782,7 @@ def run():
                 log(f"[SCAN] [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
                 driver = None
                 try:
-                    driver = make_driver()
+                    driver = make_driver(use_uc=False)  # Plain driver for scanning
                     driver.get(QLD_BOOKING_URL)
                     time.sleep(3)
                     vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
