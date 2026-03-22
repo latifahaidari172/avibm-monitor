@@ -504,109 +504,139 @@ def qld_book_slot(location, date_str, customer, vehicle):
             try{angular.element(document.body).scope().$apply();}catch(e){}
         """, token)
         time.sleep(1)
+
+        # Check CAPTCHA token is still set in the form before submitting
+        captcha_check = driver.execute_script("""
+            try {
+                var el = document.getElementById('g-recaptcha-response');
+                var val = el ? el.value : '';
+                return {len: val.length, start: val.substring(0,30)};
+            } catch(e) { return {error: e.toString()}; }
+        """)
+        log(f"  [DEBUG] CAPTCHA token length before submit: {captcha_check}")
+
         log(f"  [BOOK] Submitting booking...")
         click_next(driver, wait)
+
+        # Wait for page to react after submit
         time.sleep(4)
-        log(f"  [BOOK] Page after submit: {driver.title}")
-        clicked_popup = False
-        log(f"  Waiting for Update Booking popup (up to 30s)...")
 
-        # Dump full page source so we can find the real confirmation text
-        time.sleep(3)
-        full_source = driver.page_source
-        full_lower = full_source.lower()
-        log(f"  [DEBUG] Page title after submit: {driver.title}")
-        log(f"  [DEBUG] Page URL after submit: {driver.current_url}")
-        log(f"  [DEBUG] Full page source ({len(full_source)} chars) — printing in chunks:")
-        for i in range(0, min(len(full_source), 6000), 600):
-            log(f"  [DEBUG] [{i}] {full_source[i:i+600]}")
-
-        # Strategy 1 — check if booking already confirmed without a popup
-        already_confirmed = any(w in full_lower for w in [
-            "booking has been secured", "your booking reference",
-            "inspection has been booked", "booking confirmed",
-            "successfully booked", "thank you for your booking"
-        ])
-        if already_confirmed:
-            log("  ✅ Booking confirmed directly (no popup needed)!")
-            return (True, selected_time)
-
-        # Strategy 2 — wait for popup with broader search terms
+        # Phase 1 — wait for the Update Booking popup (up to 20s)
+        log(f"  Waiting for Update Booking popup (up to 20s)...")
         popup_found = False
-        for _ in range(30):  # poll every 1s for 30s
+        for i in range(20):
+            time.sleep(1)
             try:
-                src = driver.page_source.lower()
-                if any(w in src for w in ["update booking", "move booking", "earlier booking",
-                                           "would you like", "movebooking", "updatbooking"]):
+                scan = driver.execute_script("""
+                    try {
+                        var moveBtn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
+                        var dialogs = document.querySelectorAll('md-dialog, .md-dialog-container, [role="dialog"]');
+                        var dialogVisible = false;
+                        for(var d=0;d<dialogs.length;d++){
+                            if(dialogs[d].offsetParent !== null) dialogVisible = true;
+                        }
+                        return {
+                            has_move_btn: moveBtn !== null,
+                            move_btn_visible: moveBtn ? (moveBtn.offsetParent !== null) : false,
+                            dialog_visible: dialogVisible
+                        };
+                    } catch(e){ return {error: e.toString()}; }
+                """)
+                log(f"  t={i+1}s | move_btn={scan.get('has_move_btn')} visible={scan.get('move_btn_visible')}")
+                if scan.get('has_move_btn') and scan.get('move_btn_visible'):
+                    log(f"  Update Booking button found!")
                     popup_found = True
                     break
-                # Also check if confirmation already appeared while waiting
-                if any(w in src for w in ["booking has been secured", "your booking reference",
-                                           "successfully booked", "thank you for your booking"]):
-                    log("  ✅ Booking confirmed while waiting for popup!")
-                    return (True, selected_time)
-            except: pass
-            time.sleep(1)
+                if scan.get('dialog_visible'):
+                    popup_found = True
+                    break
+            except Exception as e:
+                log(f"  Scan error t={i+1}: {e}", "WARN")
 
-        if popup_found:
-            log("  Popup detected — trying all click strategies...")
-            time.sleep(1)
+        if not popup_found:
+            log(f"  ❌ Update Booking popup not found after 20s", "WARN")
+            return (False, selected_time)
 
-            # Try multiple ways to click the confirm button
-            result = driver.execute_script("""
+        # Phase 2 — click the Update Booking button via Angular triggerHandler
+        log(f"  Clicking Update Booking...")
+        time.sleep(1)
+        popup_result = driver.execute_script("""
+            try {
+                var btn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
+                if(!btn) return 'no-button';
+                // Method 1 — Angular triggerHandler (confirmed working)
                 try {
-                    // Strategy A — ng-click attribute
-                    var btn = document.querySelector('[ng-click="vm.dialog.moveBooking()"]');
-                    if (btn) { angular.element(btn).triggerHandler('click'); return 'A:triggered'; }
+                    angular.element(btn).triggerHandler('click');
+                    return 'M1-angular-triggered';
+                } catch(e1) {}
+                // Method 2 — native click
+                try { btn.click(); return 'M2-native-click'; } catch(e2) {}
+                // Method 3 — MouseEvent
+                try {
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    return 'M3-mouseEvent';
+                } catch(e3) {}
+                return 'all-methods-failed';
+            } catch(e){ return 'error:'+e.toString(); }
+        """)
+        log(f"  Popup click result: {popup_result}")
 
-                    // Strategy B — any button containing 'update' or 'move' or 'yes'
-                    var btns = document.querySelectorAll('button, a, input[type=button], input[type=submit]');
-                    for (var i = 0; i < btns.length; i++) {
-                        var t = (btns[i].textContent || btns[i].value || '').toLowerCase();
-                        if (t.includes('update') || t.includes('move') || t.includes('yes') || t.includes('confirm')) {
-                            btns[i].click();
-                            return 'B:clicked:' + t.trim();
-                        }
-                    }
-
-                    // Strategy C — Angular scope method directly
-                    try {
-                        var scope = angular.element(document.body).scope();
-                        if (scope && scope.vm && scope.vm.dialog && scope.vm.dialog.moveBooking) {
-                            scope.vm.dialog.moveBooking();
-                            scope.$apply();
-                            return 'C:scope-called';
-                        }
-                    } catch(e) {}
-
-                    return 'no-button-found';
-                } catch(e) { return 'error:' + e.toString(); }
-            """)
-            log(f"  Popup click result: {result}")
-            if result and result not in ['no-button-found'] and not result.startswith('error'):
-                clicked_popup = True
-                time.sleep(6)
-        else:
-            log(f"  Popup not found after 30s — checking if booking went through anyway", "WARN")
-
-        # Final confirmation check
+        # Phase 3 — wait for confirmation dialog (up to 30s)
+        # Real WOVI confirmation text: "Your booking was updated successfully."
+        log(f"  Waiting for confirmation dialog (up to 30s)...")
         time.sleep(3)
-        page_lower = driver.page_source.lower()
-        log(f"  [DEBUG] Final page title: {driver.title}")
-        log(f"  [DEBUG] Final URL: {driver.current_url}")
+        for i in range(30):
+            time.sleep(1)
+            try:
+                result = driver.execute_script("""
+                    try {
+                        var allText = document.body.innerText || '';
+                        var lower = allText.toLowerCase();
+                        // Exact phrases from real WOVI confirmation dialog
+                        var confirmed = lower.includes('updated successfully') ||
+                                        lower.includes('booking was updated') ||
+                                        lower.includes('new booking is') ||
+                                        lower.includes('successfully moved') ||
+                                        lower.includes('booking has been moved');
+                        // Also check inside any visible dialog specifically
+                        var dialogText = '';
+                        var dialogs = document.querySelectorAll('md-dialog, .md-dialog-container, [role="dialog"]');
+                        for(var d=0;d<dialogs.length;d++){
+                            var dt = dialogs[d].innerText || '';
+                            if(dt.trim()) dialogText += dt.trim() + '\n';
+                        }
+                        var confirmedInDialog = dialogText.toLowerCase().includes('updated successfully') ||
+                                               dialogText.toLowerCase().includes('new booking is') ||
+                                               dialogText.toLowerCase().includes('booking was updated');
+                        return {
+                            confirmed: confirmed || confirmedInDialog,
+                            dialog_text: dialogText.substring(0, 300)
+                        };
+                    } catch(e){ return {error: e.toString()}; }
+                """)
+                log(f"  t={i+1}s | confirmed={result.get('confirmed')} | dialog='{result.get('dialog_text','')[:80]}'")
+                if result.get('confirmed'):
+                    log(f"  ✅ Booking confirmed! Dialog: {result.get('dialog_text','')[:100]}")
+                    # Click GOT IT to close the dialog cleanly
+                    time.sleep(1)
+                    driver.execute_script("""
+                        try {
+                            var btns = document.querySelectorAll('button');
+                            for(var i=0;i<btns.length;i++){
+                                var t = btns[i].textContent.trim().toLowerCase();
+                                if(t.includes('got it')||t==='ok'||t==='close'||t==='dismiss'){
+                                    btns[i].click(); break;
+                                }
+                            }
+                        } catch(e){}
+                    """)
+                    return (True, selected_time)
+            except Exception as e:
+                log(f"  Poll error t={i+1}: {e}", "WARN")
 
-        confirmed = (clicked_popup or not popup_found) and any(w in page_lower for w in [
-            "booking has been secured", "your booking reference",
-            "inspection has been booked", "booking confirmed",
-            "successfully booked", "thank you for your booking",
-            "confirmed", "success", "thank you"
-        ])
-        if confirmed:
-            log(f"  ✅ Booking confirmed!")
-        else:
-            log(f"  ❌ Booking NOT confirmed — page title: {driver.title}", "WARN")
-            log(f"  [DEBUG] Page source sample: {page_lower[:300]}", "WARN")
-        return (confirmed, selected_time)
+        log(f"  ❌ No confirmation after 30s", "WARN")
+        return (False, selected_time)
+        return (False, selected_time)
     except Exception as e:
         log(f"QLD booking error: {e}", "ERROR"); return (False, "")
     finally:
