@@ -603,7 +603,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
                         var dialogs = document.querySelectorAll('md-dialog, .md-dialog-container, [role="dialog"]');
                         for(var d=0;d<dialogs.length;d++){
                             var dt = dialogs[d].innerText || '';
-                            if(dt.trim()) dialogText += dt.trim() + '\n';
+                            if(dt.trim()) dialogText += dt.trim() + ' | ';
                         }
                         var confirmedInDialog = dialogText.toLowerCase().includes('updated successfully') ||
                                                dialogText.toLowerCase().includes('new booking is') ||
