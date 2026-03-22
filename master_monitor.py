@@ -423,50 +423,45 @@ def qld_book_slot(location, date_str, customer, vehicle):
         time.sleep(2)
         log(f"  [BOOK] Filling customer details...")
 
-        def fill_angular(el, value):
-            """Fill an Angular input using ActionChains for reliable validation triggering."""
-            from selenium.webdriver.common.action_chains import ActionChains
+        def type_into_field(el, value):
+            """Type into Angular field using send_keys with JS click fallback."""
             from selenium.webdriver.common.keys import Keys
             try:
-                # Click to focus, clear, type character by character
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                el.click()
+                time.sleep(0.3)
+                # Try JS click first (works even when element not interactable via Selenium)
+                driver.execute_script("arguments[0].focus(); arguments[0].click();", el)
                 time.sleep(0.2)
-                # Clear existing value
+                # Clear and type
                 el.send_keys(Keys.CONTROL + "a")
                 el.send_keys(Keys.DELETE)
                 time.sleep(0.1)
-                # Type each character
                 for char in str(value):
                     el.send_keys(char)
-                    time.sleep(0.05)
-                # Trigger Angular validation events
+                    time.sleep(0.04)
+                # Fire Angular events
                 driver.execute_script("""
-                    var el = arguments[0];
-                    el.dispatchEvent(new Event('input', {bubbles:true}));
-                    el.dispatchEvent(new Event('change', {bubbles:true}));
-                    el.dispatchEvent(new Event('blur', {bubbles:true}));
-                    try {
-                        var scope = angular.element(el).scope();
-                        if(scope) scope.$apply();
-                    } catch(e){}
+                    var el=arguments[0];
+                    el.dispatchEvent(new Event('input',{bubbles:true}));
+                    el.dispatchEvent(new Event('change',{bubbles:true}));
+                    el.dispatchEvent(new Event('blur',{bubbles:true}));
+                    try{var s=angular.element(el).scope();if(s)s.$apply();}catch(e){}
                 """, el)
                 time.sleep(0.2)
                 return True
             except Exception as e:
-                log(f"  fill_angular error: {e}", "WARN")
+                log(f"  type_into_field error: {e}", "WARN")
                 return False
 
-        # Fill CRN — most critical field for form validation
-        crn_filled = False
+        # Fill CRN — use send_keys for proper Angular validation
         try:
             crn_el = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, "//input[@name='qldCRN']")))
-            crn_filled = fill_angular(crn_el, str(customer["crn"]))
+            type_into_field(crn_el, str(customer["crn"]))
             actual_val = crn_el.get_attribute("value")
             log(f"  [BOOK] CRN filled: '{actual_val}' (expected: '{customer['crn']}')")
             if actual_val != str(customer["crn"]):
-                log(f"  [BOOK] CRN mismatch — retrying with JS setter", "WARN")
+                log(f"  [BOOK] CRN mismatch — using JS setter fallback", "WARN")
                 driver.execute_script("""
                     var el=arguments[0]; var val=arguments[1];
                     var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
@@ -476,6 +471,8 @@ def qld_book_slot(location, date_str, customer, vehicle):
                     el.dispatchEvent(new Event('blur',{bubbles:true}));
                     try{angular.element(el).scope().$apply();}catch(e){}
                 """, crn_el, str(customer["crn"]))
+                actual_val = crn_el.get_attribute("value")
+                log(f"  [BOOK] CRN after JS setter: '{actual_val}'")
         except Exception as e:
             log(f"  [BOOK] CRN field not found: {e}", "WARN")
 
