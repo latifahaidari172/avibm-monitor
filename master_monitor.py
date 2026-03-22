@@ -233,32 +233,69 @@ def sel_by(driver, value, *xpaths):
         except: pass
     return False
 
-def click_next(driver, wait):
-    phrases = ["submit my booking request","submit booking request","submit my booking","next"]
-    for phrase in phrases:
-        try:
-            btns = driver.find_elements(By.XPATH,
-                f"//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{phrase}')] | "
-                f"//input[@type='submit'][contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{phrase}')]"
-            )
-            for btn in btns:
-                if btn.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                    time.sleep(0.5)
-                    driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(2)
-                    return True
-        except Exception:
-            continue
-    try:
-        btn = driver.find_element(By.XPATH, "//button[@type='submit'] | //input[@type='submit']")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", btn)
+def click_next(driver, wait, step=None):
+    """
+    Click the correct Next button for the given step.
+    step options: 'time', 'vehicle', 'customer', 'submit'
+    If step is None, falls back to finding first visible Next button.
+    """
+    # Step-specific Angular scope calls — most reliable approach
+    step_actions = {
+        'time':     "vm.steps.timeLocation.validated=true; vm.steps.timeLocation.nextStep();",
+        'vehicle':  "vm.steps.vehicleDetails.validated=true; vm.steps.vehicleDetails.nextStep();",
+        'customer': "vm.steps.customerDetails.validated=true; vm.steps.customerDetails.nextStep();",
+    }
+
+    if step and step in step_actions:
+        result = driver.execute_script(f"""
+            try {{
+                var scope = angular.element(document.body).scope();
+                if(scope && scope.vm) {{
+                    scope.$apply(function() {{ scope.vm.{step_actions[step]} }});
+                    return 'scope-applied:{step}';
+                }}
+                // Fallback — find button by ng-click containing the step name
+                var btns = document.querySelectorAll('button');
+                for(var i=0;i<btns.length;i++) {{
+                    var ngc = btns[i].getAttribute('ng-click') || btns[i].getAttribute('data-ng-click') || '';
+                    if(ngc.includes('{step}') && ngc.toLowerCase().includes('next')) {{
+                        btns[i].click();
+                        return 'clicked-by-ngclick:{step}';
+                    }}
+                }}
+                return 'step-not-found:{step}';
+            }} catch(e) {{ return 'error:'+e.toString(); }}
+        """)
+        log(f"  click_next({step}): {result}")
         time.sleep(2)
-        return True
-    except Exception:
-        return False
+        if result and 'error' not in str(result) and 'not-found' not in str(result):
+            return True
+
+    # Fallback — find Next button by ng-click pattern (most specific first)
+    result = driver.execute_script("""
+        try {
+            var btns = document.querySelectorAll('button');
+            var nextBtns = [];
+            for(var i=0;i<btns.length;i++){
+                var ngc = btns[i].getAttribute('ng-click') || btns[i].getAttribute('data-ng-click') || '';
+                var txt = btns[i].textContent.trim().toLowerCase();
+                if((txt === 'next' || txt.includes('submit')) && btns[i].offsetParent !== null){
+                    nextBtns.push({btn: btns[i], ngc: ngc, txt: txt});
+                }
+            }
+            // Prefer the last visible Next button (deepest in the form flow)
+            if(nextBtns.length > 0){
+                var target = nextBtns[nextBtns.length - 1];
+                target.btn.scrollIntoView({block:'center'});
+                target.btn.click();
+                return 'clicked-last-next:' + target.ngc;
+            }
+            return 'no-next-found';
+        } catch(e){ return 'error:'+e.toString(); }
+    """)
+    log(f"  click_next(fallback): {result}")
+    time.sleep(2)
+    return result and 'error' not in str(result) and 'no-next-found' not in str(result)
 
 # ── QLD Monitor ───────────────────────────────────────────────────────────────
 
@@ -395,7 +432,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
             log(f"  [BOOK] Time slot error: {e}", "WARN")
         time.sleep(1)
         log(f"  [BOOK] Clicking Next (after time)...")
-        click_next(driver, wait)
+        click_next(driver, wait, step="time")
         time.sleep(3)
         log(f"  [BOOK] Filling vehicle details...")
         vtype = vehicle.get("vehicle_type","Car")
@@ -419,7 +456,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
         sel_by(driver, vehicle["purchase_method"],
                "//select[contains(@ng-model,'purchase') or contains(@name,'purchase')]")
         log(f"  [BOOK] Clicking Next (after vehicle details)...")
-        click_next(driver, wait)
+        click_next(driver, wait, step="vehicle")
         time.sleep(2)
         log(f"  [BOOK] Filling customer details...")
 
@@ -524,7 +561,7 @@ def qld_book_slot(location, date_str, customer, vehicle):
         log(f"  [BOOK] Customer fields verification: {verification}")
 
         log(f"  [BOOK] Clicking Next (after customer details)...")
-        click_next(driver, wait)
+        click_next(driver, wait, step="customer")
         time.sleep(3)
 
         # Debug — log current page state after clicking Next
