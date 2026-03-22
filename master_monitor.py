@@ -7,6 +7,7 @@ cron-job.org pings /run every 1 minute.
 """
 
 import csv, json, os, re, smtplib, sys, time, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -711,60 +712,92 @@ def run():
 
         if qld_customers:
             qld_customers.sort(key=lambda c: TIER_ORDER.get(c.get("tier","standard"), 1))
-            log(f"Checking {len(qld_customers)} QLD customer(s)...")
-            driver = make_driver()
-            booking_jobs = []
-            try:
-                driver.get(QLD_BOOKING_URL)
-                time.sleep(3)
-                for customer in qld_customers:
-                    tier = customer.get("tier", "standard")
-                    vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
-                    for vehicle in vehicles:
-                        raw_cutoff = vehicle.get("cutoff_date","")
-                        cutoff = parse_date(raw_cutoff)
-                        if not cutoff:
-                            log(f"  Skipping {customer['first_name']} — invalid cutoff: {raw_cutoff}", "WARN")
-                            continue
-                        now_naive = datetime.now()
-                        if (now_naive - cutoff).total_seconds() > 86400:
-                            log(f"  Auto-deactivating vehicle — cutoff passed by 24h")
-                            db_patch("vehicles", "id", vehicle["id"], {"active": False})
-                            continue
-                        label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
-                        log(f"Checking [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
-                        vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
-                        slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
-                        log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
-                        if vehicle.get("booking_in_progress"):
-                            started_at = vehicle.get("booking_started_at")
-                            if started_at:
-                                try:
-                                    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                                    age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
-                                    if age_mins < 5:
-                                        log(f"  Skipping — booking in progress ({age_mins:.1f} min ago)")
-                                        continue
-                                    else:
-                                        db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
-                                except Exception:
+            log(f"Checking {len(qld_customers)} QLD customer(s) in parallel...")
+
+            # Build flat list of all vehicle jobs to scan
+            scan_jobs = []
+            for customer in qld_customers:
+                tier = customer.get("tier", "standard")
+                vehicles = [v for v in (customer.get("vehicles") or []) if v.get("active")]
+                for vehicle in vehicles:
+                    raw_cutoff = vehicle.get("cutoff_date","")
+                    cutoff = parse_date(raw_cutoff)
+                    if not cutoff:
+                        log(f"  Skipping {customer['first_name']} — invalid cutoff: {raw_cutoff}", "WARN")
+                        continue
+                    now_naive = datetime.now()
+                    if (now_naive - cutoff).total_seconds() > 86400:
+                        log(f"  Auto-deactivating vehicle — cutoff passed by 24h")
+                        db_patch("vehicles", "id", vehicle["id"], {"active": False})
+                        continue
+                    if vehicle.get("booking_in_progress"):
+                        started_at = vehicle.get("booking_started_at")
+                        if started_at:
+                            try:
+                                started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                                age_mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+                                if age_mins < 5:
+                                    log(f"  Skipping {customer['first_name']} — booking in progress ({age_mins:.1f} min ago)")
                                     continue
-                            else:
+                                else:
+                                    db_patch("vehicles", "id", vehicle["id"], {"booking_in_progress": False, "booking_started_at": None})
+                            except Exception:
                                 continue
-                        if slots:
-                            priority_locs = vehicle.get("priority_locations") or []
-                            if priority_locs:
-                                earliest_dt = slots[0][0]
-                                priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
-                                chosen = priority_slots[0] if priority_slots else slots[0]
-                            else:
-                                chosen = slots[0]
-                            dt, ds, loc = chosen
-                            log(f"  → Earlier slot: {ds} at {loc}")
+                        else:
+                            continue
+                    scan_jobs.append((customer, vehicle, cutoff, tier))
+
+            log(f"  {len(scan_jobs)} vehicle(s) to scan in parallel (max 10 at once)")
+
+            # Parallel scan — each vehicle gets its own Chrome instance
+            # Cap at 10 simultaneous instances to avoid memory exhaustion
+            MAX_PARALLEL = 10
+            booking_jobs = []
+            booking_jobs_lock = threading.Lock()
+
+            def scan_one_vehicle(customer, vehicle, cutoff, tier):
+                label = f"{customer['first_name']} {customer['last_name']} / {vehicle.get('label', vehicle.get('make','?'))}"
+                log(f"[SCAN] [{TIER_LABEL[tier]}] {label} — cutoff {cutoff.strftime('%d/%m/%Y')}")
+                driver = None
+                try:
+                    driver = make_driver()
+                    driver.get(QLD_BOOKING_URL)
+                    time.sleep(3)
+                    vehicle_locations = vehicle.get("locations") or QLD_LOCATIONS
+                    slots = qld_find_slots(driver, cutoff, label, vehicle_locations)
+                    log_result(customer["id"], vehicle["id"], "QLD", "All", "Checked", f"{len(slots)} slots found")
+                    if slots:
+                        priority_locs = vehicle.get("priority_locations") or []
+                        if priority_locs:
+                            earliest_dt = slots[0][0]
+                            priority_slots = [s for s in slots if s[2] in priority_locs and s[0] == earliest_dt]
+                            chosen = priority_slots[0] if priority_slots else slots[0]
+                        else:
+                            chosen = slots[0]
+                        dt, ds, loc = chosen
+                        log(f"[SCAN] {label} → Earlier slot: {ds} at {loc}")
+                        with booking_jobs_lock:
                             booking_jobs.append((customer, vehicle, dt, ds, loc, tier))
-            finally:
-                try: driver.quit()
-                except: pass
+                    else:
+                        log(f"[SCAN] {label} → No earlier slots found")
+                except Exception as e:
+                    log(f"[SCAN] Error for {label}: {e}", "ERROR")
+                finally:
+                    if driver:
+                        try: driver.quit()
+                        except: pass
+
+            # Run scans in batches of MAX_PARALLEL
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
+                futures = [
+                    executor.submit(scan_one_vehicle, customer, vehicle, cutoff, tier)
+                    for customer, vehicle, cutoff, tier in scan_jobs
+                ]
+                for future in as_completed(futures):
+                    try: future.result()
+                    except Exception as e: log(f"Scan thread error: {e}", "ERROR")
+
+            log(f"All scans complete — {len(booking_jobs)} booking job(s) queued")
 
             def book_vehicle(customer, vehicle, dt, ds, loc, tier, delay=0):
                 if delay > 0:
